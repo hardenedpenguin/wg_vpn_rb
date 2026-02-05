@@ -281,8 +281,16 @@ end
 
 def monitor
   root_check
-  puts 'Live monitor (Ctrl+C to stop):'
-  run('watch', '-n', '2', 'wg show wg0') rescue run('wg', 'show', 'wg0')
+  puts 'Live monitor (press q to quit):'
+  script = <<~BASH
+    while true; do
+      clear
+      wg show wg0
+      read -t 2 -n 1 key || true
+      [[ "$key" == "q" || "$key" == "Q" ]] && break
+    done
+  BASH
+  run('bash', '-c', script.strip, exception: true)
 end
 
 def show_server_key
