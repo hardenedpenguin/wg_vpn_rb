@@ -94,7 +94,6 @@ def next_client_ip
   rescue Errno::EACCES, Errno::ENOENT
     next
   end
-end
   n = (2..254).find { |i| !used.include?(i) } || (raise 'No free client IP in 10.8.0.0/24')
   "10.8.0.#{n}"
 end

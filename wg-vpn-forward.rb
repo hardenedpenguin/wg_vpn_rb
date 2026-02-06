@@ -15,7 +15,7 @@ EXIT_NOT_FOUND  = 2
 EXIT_PERMISSION = 3
 
 def script_path
-  File.expand_path($PROGRAM_NAME)
+  File.expand_path(File.realpath(__FILE__))
 end
 
 def usage
