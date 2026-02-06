@@ -30,6 +30,14 @@ def ask(prompt)
   $stdin.gets&.strip || ''
 end
 
+def default_interface
+  confs = Dir[File.join(WG_DIR, '*.conf')].map { |p| File.basename(p, '.conf') }
+  return 'wg0' if confs.empty?
+  return confs.first if confs.size == 1
+  up = `wg show interfaces 2>/dev/null`.split
+  (confs & up).first || confs.first
+end
+
 def setup(config_path = nil)
   root_check
   debian_check
@@ -71,7 +79,7 @@ end
 def up(interface = nil)
   root_check
   interface ||= ARGV[1]
-  interface ||= 'wg0'
+  interface ||= default_interface
   run('wg-quick', 'up', interface, exception: true)
   puts "#{interface} is up."
 end
@@ -79,7 +87,7 @@ end
 def down(interface = nil)
   root_check
   interface ||= ARGV[1]
-  interface ||= 'wg0'
+  interface ||= default_interface
   run('wg-quick', 'down', interface, exception: true)
   puts "#{interface} is down."
 end
@@ -87,8 +95,26 @@ end
 def status(interface = nil)
   root_check
   interface ||= ARGV[1]
-  interface ||= 'wg0'
+  interface ||= default_interface
   run('wg', 'show', interface, exception: true)
+end
+
+def enable_boot(interface = nil)
+  root_check
+  interface ||= ARGV[1]
+  interface ||= default_interface
+  conf = File.join(WG_DIR, "#{interface}.conf")
+  raise "Config not found: #{conf}" unless File.file?(conf)
+  run('systemctl', 'enable', "wg-quick@#{interface}", exception: true)
+  puts "Enabled wg-quick@#{interface} on boot."
+end
+
+def disable_boot(interface = nil)
+  root_check
+  interface ||= ARGV[1]
+  interface ||= default_interface
+  run('systemctl', 'disable', "wg-quick@#{interface}", exception: true)
+  puts "Disabled wg-quick@#{interface} on boot."
 end
 
 # Subcommands
@@ -101,14 +127,20 @@ when 'down'
   down
 when 'status'
   status
+when 'enable-boot'
+  enable_boot
+when 'disable-boot'
+  disable_boot
 when nil, ''
-  puts "Usage: #{$0} setup [config_path] | up [interface] | down [interface] | status [interface]"
-  puts '  setup   - Install wireguard, copy config to /etc/wireguard, bring up tunnel (default interface: from config filename)'
-  puts '  up      - Bring up tunnel (default: wg0)'
-  puts '  down    - Bring down tunnel (default: wg0)'
-  puts '  status  - Show wg show (default: wg0)'
+  puts "Usage: #{$0} setup [config_path] | up [interface] | down [interface] | status [interface] | enable-boot [interface] | disable-boot [interface]"
+  puts '  setup       - Install wireguard, copy config to /etc/wireguard, bring up tunnel (default interface: from config filename)'
+  puts '  up          - Bring up tunnel (default: auto-detect from /etc/wireguard)'
+  puts '  down        - Bring down tunnel (default: auto-detect)'
+  puts '  status      - Show wg show (default: auto-detect)'
+  puts '  enable-boot - Enable systemd service to start tunnel on boot (default: auto-detect)'
+  puts '  disable-boot- Disable systemd service for tunnel on boot (default: auto-detect)'
   exit 1
 else
-  puts "Usage: #{$0} [ setup [config_path] | up [interface] | down [interface] | status [interface] ]"
+  puts "Usage: #{$0} [ setup [config_path] | up [interface] | down [interface] | status [interface] | enable-boot [interface] | disable-boot [interface] ]"
   exit 1
 end
