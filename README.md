@@ -182,6 +182,77 @@ The interface name is taken from the config filename (e.g. `work-laptop.conf` â†
 
 ---
 
+## Port forward (wg-vpn-forward.rb)
+
+**wg-vpn-forward.rb** forwards a port on the VPN server (or any host) to a port on a VPN client. Use it when a service runs on a client (e.g. 10.8.0.2:4569) and you want it reachable via the server (e.g. 10.10.2.3:4569).
+
+On **Debian 13** the script is managed by **systemd**: install once, add forwards to the config, start/stop with `systemctl`. Forwards persist across reboots.
+
+### One-time setup (as root)
+
+```bash
+sudo ./wg-vpn-forward.rb install
+```
+
+This creates `/etc/systemd/system/wg-vpn-forward.service`, `/etc/wg-vpn-forward.conf`, enables the service, and starts it if any forwards are configured.
+
+### Commands
+
+| Command | Description |
+|--------|-------------|
+| `install` | Install systemd service and config (run once as root). |
+| `add [--bind ADDR] [--udp] PORT TARGET_IP [TARGET_PORT]` | Add a TCP or UDP forward and restart the service. |
+| `remove [--udp] PORT TARGET_IP [TARGET_PORT]` | Remove a forward (use `--udp` to remove only the UDP entry). |
+| `list` | Show configured forwards. |
+
+### Config file
+
+`/etc/wg-vpn-forward.conf` â€” one forward per line:
+
+```text
+[udp] PORT TARGET_IP [TARGET_PORT]
+```
+
+Optional: `--bind ADDR` at the start of a line to bind to a specific address; `udp` for UDP (default is TCP).
+
+### Examples
+
+```bash
+# One-time install (as root)
+sudo ./wg-vpn-forward.rb install
+
+# Add forwards (as root)
+sudo ./wg-vpn-forward.rb add 4569 10.8.0.2
+sudo ./wg-vpn-forward.rb add --udp 4569 10.8.0.2
+sudo ./wg-vpn-forward.rb add --bind 10.10.2.3 4569 10.8.0.2
+sudo ./wg-vpn-forward.rb add 8080 10.8.0.2 80
+
+# List forwards
+./wg-vpn-forward.rb list
+
+# Remove a forward (use --udp to remove only the UDP entry)
+sudo ./wg-vpn-forward.rb remove 4569 10.8.0.2
+sudo ./wg-vpn-forward.rb remove --udp 4569 10.8.0.2
+
+# Manage service
+sudo systemctl start|stop|restart|status wg-vpn-forward
+```
+
+### One-off run (no systemd)
+
+For a quick test without installing the service:
+
+```bash
+./wg-vpn-forward.rb 4569 10.8.0.2
+./wg-vpn-forward.rb --udp 4569 10.8.0.2
+./wg-vpn-forward.rb --bind 10.10.2.3 4569 10.8.0.2
+./wg-vpn-forward.rb 8080 10.8.0.2 80
+```
+
+Press Ctrl+C to stop. Root is only needed for ports &lt; 1024.
+
+---
+
 ## Quick reference
 
 ```text
