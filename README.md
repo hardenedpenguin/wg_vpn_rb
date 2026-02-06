@@ -84,7 +84,7 @@ You get a menu: Add Client, Remove Client, List Clients, Show Connected, Live Mo
 | Command | Description |
 |--------|-------------|
 | `setup` | Install packages, configure firewall, create server config, start WireGuard |
-| `add-client [server_ip] [name]` | Add a client; prompts for server IP and name if omitted |
+| `add-client [server_ip] [name] [full]` | Add a client; prompts for server IP and name if omitted. Use `full` (or `y`/`yes`/`1`) to route all traffic through VPN |
 | `remove-client [name]` | Remove a client by name |
 | `list-clients` | List clients and latest handshakes |
 | `show-connected` | Show `wg show wg0` |
@@ -113,6 +113,12 @@ sudo ./wg-vpn.rb add-client
 ```bash
 sudo ./wg-vpn.rb add-client 203.0.113.10 my-phone
 # Uses server endpoint 203.0.113.10:51820 and client name "my-phone"
+```
+
+**Add a client with all traffic through VPN (non-interactive)**
+
+```bash
+sudo ./wg-vpn.rb add-client 203.0.113.10 my-phone full
 ```
 
 **Remove a client**
@@ -179,7 +185,7 @@ The interface name is taken from the config filename (e.g. `work-laptop.conf` â†
 ## Quick reference
 
 ```text
-Usage: wg-vpn.rb [ setup | add-client [server_ip] [name] | remove-client [name] | list-clients | show-connected | monitor | show-key ]
+Usage: wg-vpn.rb [ setup | add-client [server_ip] [name] [full] | remove-client [name] | list-clients | show-connected | monitor | show-key ]
   No args: interactive menu.
 ```
 
