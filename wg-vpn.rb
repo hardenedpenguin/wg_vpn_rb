@@ -44,6 +44,36 @@ def capture(*cmd, **opts)
   out.strip
 end
 
+# Parse server config: peer public key -> client IP (from AllowedIPs 10.8.0.x/32).
+def peer_pubkey_to_ip
+  return {} unless File.file?(WG_CONF)
+  h = {}
+  File.read(WG_CONF).scan(/\[Peer\](.*?)(?=\[Peer\]|\z)/m).each do |block|
+    pub = block[0][/PublicKey\s*=\s*(\S+)/, 1]
+    allowed = block[0][/AllowedIPs\s*=\s*10\.8\.0\.(\d+)/, 1]
+    h[pub] = "10.8.0.#{allowed}" if pub && allowed
+  end
+  h
+end
+
+# Client config: ip (no CIDR) -> name. Use plain IP so it matches peer_pubkey_to_ip.
+def client_ip_to_name
+  return {} unless File.directory?(WG_CLIENTS)
+  Dir[File.join(WG_CLIENTS, '*.conf')].each_with_object({}) do |f, h|
+    ip = File.read(f)[/Address\s*=\s*(\d+\.\d+\.\d+\.\d+)/, 1] rescue nil
+    h[ip] = File.basename(f, '.conf') if ip
+  end
+end
+
+def handshake_age(ts)
+  return 'never' if ts.nil? || ts.to_i <= 0
+  sec = Time.now.to_i - ts.to_i
+  return "#{sec}s ago" if sec < 60
+  return "#{sec / 60} min ago" if sec < 3600
+  return "#{sec / 3600} h ago" if sec < 86400
+  "#{sec / 86400} days ago"
+end
+
 # Apply server config. wg syncconf only accepts kernel keys (PrivateKey, ListenPort);
 # Address/DNS are wg-quick extensions, so we use wg-quick reload (full config) or
 # wg-quick strip + wg syncconf as fallback.
@@ -281,13 +311,26 @@ def list_clients
     puts 'No clients directory.'
     return
   end
-  Dir[File.join(WG_CLIENTS, '*.conf')].each do |f|
-    name = File.basename(f, '.conf')
-    ip = File.read(f)[/Address\s*=\s*(\S+)/, 1] rescue '-'
-    puts "  #{name}: #{ip}"
+  pub_to_ip = peer_pubkey_to_ip
+  ip_to_pub = pub_to_ip.invert
+  ip_to_name = client_ip_to_name
+  handshakes = {}
+  begin
+    capture('wg', 'show', 'wg0', 'latest-handshakes').each_line do |line|
+      pub, ts = line.split
+      handshakes[pub] = ts if pub && ts
+    end
+  rescue StandardError
+    # wg0 may be down or no peers
   end
-  puts "\nConnected (wg show):"
-  run('wg', 'show', 'wg0', 'latest-handshakes') rescue nil
+
+  ip_to_name.each do |ip, name|
+    pub = ip_to_pub[ip]
+    ts = pub ? handshakes[pub] : nil
+    age = handshake_age(ts)
+    puts "  #{name}: #{ip}  (last seen: #{age})"
+  end
+  puts "\n(No recent handshake usually means client is down; WireGuard does not detect disconnect.)"
 end
 
 def show_connected
