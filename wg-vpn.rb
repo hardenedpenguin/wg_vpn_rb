@@ -16,6 +16,7 @@ SERVER_PUB = File.join(WG_DIR, 'server.pub')
 VPN_SUBNET = '10.8.0.0/24'
 VPN_SERVER_IP = '10.8.0.1'
 WG_PORT = 51820
+CLIENT_DNS = '1.1.1.1'  # DNS in generated client configs; change if desired
 
 def run(*cmd, **opts)
   system(*cmd, **opts) || (raise "Command failed: #{cmd.join(' ')}")
@@ -51,7 +52,7 @@ def apply_wg0_conf
   return unless capture('wg', 'show', 'interfaces').include?('wg0')
   # Prefer wg-quick reload so full config (Address, etc.) is applied
   run('systemctl', 'reload', 'wg-quick@wg0', exception: true)
-rescue
+rescue StandardError
   # Fallback: strip wg-quick-only keys, then wg syncconf (requires bash process substitution)
   run('bash', '-c', "wg syncconf wg0 <(wg-quick strip #{WG_CONF})", exception: true)
 end
@@ -88,9 +89,12 @@ def next_client_ip
     used << m[0].to_i
   end
   Dir[File.join(WG_CLIENTS, '*.conf')].each do |f|
-    c = File.read(f) rescue ''
+    c = File.read(f)
     c.scan(/Address\s*=\s*10\.8\.0\.(\d+)/).each { |m| used << m[0].to_i }
+  rescue Errno::EACCES, Errno::ENOENT
+    next
   end
+end
   n = (2..254).find { |i| !used.include?(i) } || (raise 'No free client IP in 10.8.0.0/24')
   "10.8.0.#{n}"
 end
@@ -119,7 +123,11 @@ def setup_server
 
   puts 'Enabling IP forwarding...'
   run('sysctl', '-w', 'net.ipv4.ip_forward=1', exception: true)
-  run('sh', '-c', 'echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-wireguard.conf', exception: true)
+  sysctl_conf = '/etc/sysctl.d/99-wireguard.conf'
+  line = "net.ipv4.ip_forward=1"
+  unless File.file?(sysctl_conf) && File.read(sysctl_conf).include?(line)
+    File.open(sysctl_conf, 'a') { |f| f.puts line }
+  end
 
   ensure_dirs
   pub = ensure_server_keys
@@ -198,7 +206,7 @@ def add_client(server_endpoint = nil, client_name = nil, route_all_traffic = nil
     [Interface]
     PrivateKey = #{client_priv}
     Address = #{client_ip}/24
-    DNS = 1.1.1.1
+    DNS = #{CLIENT_DNS}
 
     [Peer]
     PublicKey = #{server_pub}
@@ -245,11 +253,16 @@ def remove_client(name = nil)
     exit 1
   end
 
-  # Remove peer block from server config
+  # Remove peer block from server config (entire [Peer] block that contains this client's AllowedIPs)
   content = File.read(WG_CONF)
-  block = content.slice!(/\n\[Peer\]\s*\nPublicKey\s*=\s*\S+\s*\nAllowedIPs\s*=\s*#{Regexp.escape(client_ip)}\/\d+\s*\n/)
-  if block
-    File.write(WG_CONF, normalize_wg_config(content))
+  blocks = content.split(/(?=\[Peer\])/).reject(&:empty?)
+  interface_part = blocks[0] || ''
+  peer_blocks = blocks[1..] || []
+  target_ip_pattern = /AllowedIPs\s*=\s*#{Regexp.escape(client_ip)}\/\d+/
+  peer_blocks_to_keep = peer_blocks.reject { |b| b =~ target_ip_pattern }
+  if peer_blocks_to_keep.size < peer_blocks.size
+    new_content = ([interface_part] + peer_blocks_to_keep).join("\n").gsub(/\n{3,}/, "\n\n")
+    File.write(WG_CONF, normalize_wg_config(new_content))
     File.delete(client_conf)
     apply_wg0_conf
     puts "Removed client: #{name}"
