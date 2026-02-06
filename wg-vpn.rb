@@ -149,12 +149,16 @@ def setup_server
   File.write(WG_CONF, normalize_wg_config(conf))
   FileUtils.chmod(0o600, WG_CONF)
 
-  puts 'Configuring firewalld (UDP 51820, masquerade)...'
+  puts 'Configuring firewalld (UDP 51820, masquerade, trusted wg0)...'
   run('firewall-cmd', '--permanent', '--add-port', "#{WG_PORT}/udp", exception: true)
   run('firewall-cmd', '--permanent', '--add-masquerade', exception: true)
   run('firewall-cmd', '--reload', exception: true)
 
   run('systemctl', 'enable', '--now', 'wg-quick@wg0', exception: true)
+
+  # Allow client-to-client: put wg0 in trusted zone so forwarded VPN traffic is accepted
+  run('firewall-cmd', '--permanent', '--zone=trusted', '--add-interface=wg0', exception: true)
+  run('firewall-cmd', '--reload', exception: true)
 
   puts "\nServer setup complete."
   puts "Server public key: #{pub}"
