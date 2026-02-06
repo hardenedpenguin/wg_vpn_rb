@@ -201,9 +201,11 @@ This creates `/etc/systemd/system/wg-vpn-forward.service`, `/etc/wg-vpn-forward.
 | Command | Description |
 |--------|-------------|
 | `install` | Install systemd service and config (run once as root). |
-| `add [--bind ADDR] [--udp] PORT TARGET_IP [TARGET_PORT]` | Add a TCP or UDP forward and restart the service. |
-| `remove [--udp] PORT TARGET_IP [TARGET_PORT]` | Remove a forward (use `--udp` to remove only the UDP entry). |
-| `list` | Show configured forwards. |
+| `status` | Show service state (active/inactive) and configured forwards. |
+| `add [--bind ADDR] [--udp] PORT TARGET_IP [TARGET_PORT]` | Add a TCP or UDP forward to the config. Duplicate forwards are rejected. Restart the service to apply. |
+| `remove [--udp] PORT TARGET_IP [TARGET_PORT]` | Remove matching forward(s) from the config. Without `--udp`, removes both TCP and UDP for that port/target. Restart the service to apply. |
+| `remove INDEX` | Remove the forward at list index (e.g. `remove 1`). Restart the service to apply. |
+| `list` | Show service state and configured forwards (with indexes). |
 
 ### Config file
 
@@ -213,7 +215,7 @@ This creates `/etc/systemd/system/wg-vpn-forward.service`, `/etc/wg-vpn-forward.
 [udp] PORT TARGET_IP [TARGET_PORT]
 ```
 
-Optional: `--bind ADDR` at the start of a line to bind to a specific address; `udp` for UDP (default is TCP).
+Optional: `--bind ADDR` at the start of a line to bind to a specific address; `udp` for UDP (default is TCP). Inline comments with `#` are allowed (e.g. `4569 10.8.0.2  # my-app`). Invalid lines cause the daemon to exit with an error (see `journalctl -u wg-vpn-forward`).
 
 ### Examples
 
@@ -227,29 +229,26 @@ sudo ./wg-vpn-forward.rb add --udp 4569 10.8.0.2
 sudo ./wg-vpn-forward.rb add --bind 10.10.2.3 4569 10.8.0.2
 sudo ./wg-vpn-forward.rb add 8080 10.8.0.2 80
 
-# List forwards
+# Show service state and forwards
+./wg-vpn-forward.rb status
+
+# List forwards (with indexes)
 ./wg-vpn-forward.rb list
 
-# Remove a forward (use --udp to remove only the UDP entry)
+# Remove a forward (without --udp removes both TCP and UDP for that port/target)
 sudo ./wg-vpn-forward.rb remove 4569 10.8.0.2
 sudo ./wg-vpn-forward.rb remove --udp 4569 10.8.0.2
+# Remove by list index
+sudo ./wg-vpn-forward.rb remove 1
+
+# After add or remove, restart the service to apply
+sudo systemctl restart wg-vpn-forward
 
 # Manage service
 sudo systemctl start|stop|restart|status wg-vpn-forward
 ```
 
-### One-off run (no systemd)
-
-For a quick test without installing the service:
-
-```bash
-./wg-vpn-forward.rb 4569 10.8.0.2
-./wg-vpn-forward.rb --udp 4569 10.8.0.2
-./wg-vpn-forward.rb --bind 10.10.2.3 4569 10.8.0.2
-./wg-vpn-forward.rb 8080 10.8.0.2 80
-```
-
-Press Ctrl+C to stop. Root is only needed for ports &lt; 1024.
+Only the systemd configuration is supported: the script edits the config file and exits. The service runs under systemd; use `systemctl restart wg-vpn-forward` after adding or removing forwards to apply changes.
 
 ---
 

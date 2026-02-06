@@ -10,6 +10,10 @@ require 'socket'
 DEFAULT_CONFIG = '/etc/wg-vpn-forward.conf'
 SYSTEMD_UNIT   = '/etc/systemd/system/wg-vpn-forward.service'
 
+EXIT_USAGE      = 1
+EXIT_NOT_FOUND  = 2
+EXIT_PERMISSION = 3
+
 def script_path
   File.expand_path($PROGRAM_NAME)
 end
@@ -18,16 +22,14 @@ def usage
   puts <<~USAGE
     Usage:
       #{$0} install                    Install systemd service (run once as root).
-      #{$0} add [--bind ADDR] [--udp] PORT TARGET_IP [TARGET_PORT]   Add a forward and restart service.
-      #{$0} remove [--udp] PORT TARGET_IP [TARGET_PORT]             Remove a forward and restart service.
+      #{$0} status                    Show service state and configured forwards.
+      #{$0} add [--bind ADDR] [--udp] PORT TARGET_IP [TARGET_PORT]
+      #{$0} remove [--udp] PORT TARGET_IP [TARGET_PORT]
+      #{$0} remove INDEX              Remove by list index (e.g. remove 1).
       #{$0} list                      Show configured forwards.
       #{$0} [--config PATH]           Run as daemon (used by systemd; reads config).
 
-      # One-off run (no systemd): [--udp] PORT TARGET_IP [TARGET_PORT]
-      #{$0} 4569 10.8.0.2
-      #{$0} --udp 4569 10.8.0.2
-      #{$0} --bind 10.10.2.3 4569 10.8.0.2
-      #{$0} 8080 10.8.0.2 80
+    After add or remove, restart to apply: systemctl restart wg-vpn-forward
 
     Config: #{DEFAULT_CONFIG}
       One forward per line: [udp] PORT TARGET_IP [TARGET_PORT]
@@ -41,6 +43,7 @@ end
 
 def parse_config_line(line)
   line = line.strip
+  line = line.sub(/\s+#.*\z/, '').strip  # strip inline comments
   return nil if line.empty? || line.start_with?('#')
   tokens = line.split(/\s+/)
   bind_addr = '0.0.0.0'
@@ -64,6 +67,31 @@ end
 def parse_config(path)
   return [] unless File.file?(path)
   File.readlines(path).filter_map { |line| parse_config_line(line) }
+end
+
+# Returns [forwards, nil] or [nil, "line N: reason"] on first parse error.
+def parse_config_validate(path)
+  return [[], nil] unless File.file?(path)
+  forwards = []
+  File.readlines(path).each_with_index do |line, i|
+    line = line.strip.sub(/\s+#.*\z/, '').strip
+    next if line.empty? || line.start_with?('#')
+    parsed = parse_config_line(line)
+    unless parsed
+      return [nil, "line #{i + 1}: invalid forward (expected [udp] PORT TARGET_IP [TARGET_PORT])"]
+    end
+    forwards << parsed
+  end
+  [forwards, nil]
+end
+
+def service_active?
+  system('systemctl', 'is-active', 'wg-vpn-forward.service', out: File::NULL, err: File::NULL)
+end
+
+def port_in_use_hint(port, udp: false)
+  cmd = udp ? "ss -ulnp | grep #{port}" : "ss -tlnp | grep #{port}"
+  " Check: #{cmd}"
 end
 
 def relay_tcp(client, target)
@@ -91,7 +119,7 @@ def run_one_tcp_forward(bind_addr, listen_port, target_host, target_port)
     end
   end
 rescue Errno::EADDRINUSE => e
-  warn "Port #{listen_port} in use: #{e.message}"
+  warn "Port #{listen_port} in use: #{e.message}#{port_in_use_hint(listen_port, udp: false)}"
   raise
 end
 
@@ -130,14 +158,18 @@ def run_one_udp_forward(bind_addr, listen_port, target_host, target_port)
   $stderr.puts "[wg-vpn-forward] UDP #{bind_addr}:#{listen_port} -> #{target_host}:#{target_port}"
   relay_udp(sock, target_host, target_port)
 rescue Errno::EADDRINUSE => e
-  warn "Port #{listen_port} in use: #{e.message}"
+  warn "Port #{listen_port} in use: #{e.message}#{port_in_use_hint(listen_port, udp: true)}"
   raise
 rescue Errno::EBADF
   # socket closed
 end
 
 def daemon_mode(config_path)
-  forwards = parse_config(config_path)
+  forwards, err = parse_config_validate(config_path)
+  if err
+    $stderr.puts "[wg-vpn-forward] Config error: #{err}"
+    exit(EXIT_USAGE)
+  end
   if forwards.empty?
     $stderr.puts "[wg-vpn-forward] No forwards in #{config_path}; exiting."
     exit 0
@@ -157,7 +189,7 @@ end
 def root_check
   return if Process.uid == 0
   warn 'This command must be run as root (e.g. sudo).'
-  exit 1
+  exit(EXIT_PERMISSION)
 end
 
 def systemd_unit_content
@@ -190,7 +222,7 @@ def install_subcmd
   system('systemctl', 'enable', 'wg-vpn-forward.service') || (warn 'systemctl enable failed'; exit(1))
   puts 'Enabled wg-vpn-forward.service'
   if parse_config(DEFAULT_CONFIG).empty?
-    puts 'No forwards in config yet. Add one with: ' + $PROGRAM_NAME + ' add 4569 10.8.0.2'
+    puts 'No forwards in config yet. Add one with: sudo ' + $PROGRAM_NAME + ' add 4569 10.8.0.2'
   else
     system('systemctl', 'start', 'wg-vpn-forward.service')
     puts 'Started wg-vpn-forward.service'
@@ -216,7 +248,13 @@ def add_subcmd(args)
   target_port = (args[2] || listen_port)&.to_i
   if listen_port.nil? || listen_port <= 0 || target_ip.to_s.empty? || target_port <= 0
     warn 'Usage: add [--bind ADDR] [--udp] PORT TARGET_IP [TARGET_PORT]'
-    exit 1
+    exit(EXIT_USAGE)
+  end
+  protocol = udp ? :udp : :tcp
+  existing = parse_config(DEFAULT_CONFIG)
+  if existing.any? { |f| f[:protocol] == protocol && f[:bind_addr] == bind_addr && f[:listen_port] == listen_port && f[:target_ip] == target_ip && f[:target_port] == target_port }
+    warn "Forward already exists: #{protocol.to_s.upcase} #{listen_port} -> #{target_ip}:#{target_port}" + (bind_addr == '0.0.0.0' ? '' : " (bind #{bind_addr})")
+    exit(EXIT_NOT_FOUND)
   end
   parts = []
   parts << '--bind' << bind_addr if bind_addr != '0.0.0.0'
@@ -226,10 +264,7 @@ def add_subcmd(args)
   File.open(DEFAULT_CONFIG, 'a') { |f| f.write(line) }
   proto = udp ? 'UDP' : 'TCP'
   puts "Added #{proto}: #{listen_port} -> #{target_ip}:#{target_port}" + (bind_addr == '0.0.0.0' ? '' : " (bind #{bind_addr})")
-  if File.file?(SYSTEMD_UNIT)
-    system('systemctl', 'restart', 'wg-vpn-forward.service')
-    puts 'Restarted wg-vpn-forward.service'
-  end
+  puts 'Restart to apply: systemctl restart wg-vpn-forward' if File.file?(SYSTEMD_UNIT)
 end
 
 def remove_subcmd(args)
@@ -240,38 +275,72 @@ def remove_subcmd(args)
     udp_only = true
     args.shift
   end
+  # Remove by index: "remove 1" when args = ["1"]
+  if args.size == 1 && args[0] =~ /\A[1-9]\d*\z/
+    idx = args[0].to_i
+    forwards = parse_config(DEFAULT_CONFIG)
+    if forwards.empty?
+      warn 'No forwards configured. Use list to see indexes.'
+      exit(EXIT_NOT_FOUND)
+    end
+    if idx < 1 || idx > forwards.size
+      warn "No forward at index #{idx} (use list to see 1..#{forwards.size})"
+      exit(EXIT_NOT_FOUND)
+    end
+    f = forwards[idx - 1]
+    lines = File.readlines(DEFAULT_CONFIG)
+    removed = false
+    lines.reject! do |l|
+      parsed = parse_config_line(l)
+      next false unless parsed
+      match = parsed[:protocol] == f[:protocol] && parsed[:bind_addr] == f[:bind_addr] && parsed[:listen_port] == f[:listen_port] && parsed[:target_ip] == f[:target_ip] && parsed[:target_port] == f[:target_port]
+      if match && !removed
+        removed = true
+        true
+      else
+        false
+      end
+    end
+    File.write(DEFAULT_CONFIG, lines.join)
+    proto = f[:protocol].to_s.upcase
+    puts "Removed #{proto} #{f[:bind_addr] == '0.0.0.0' ? '' : "(bind #{f[:bind_addr]}) "}#{f[:listen_port]} -> #{f[:target_ip]}:#{f[:target_port]}"
+    puts 'Restart to apply: systemctl restart wg-vpn-forward' if File.file?(SYSTEMD_UNIT)
+    return
+  end
   listen_port = args[0]&.to_i
   target_ip   = args[1]
   target_port = args[2]&.to_i
   if listen_port.nil? || listen_port <= 0 || target_ip.to_s.empty?
-    warn 'Usage: remove [--udp] PORT TARGET_IP [TARGET_PORT]'
-    exit 1
+    warn 'Usage: remove [--udp] PORT TARGET_IP [TARGET_PORT] or remove INDEX'
+    exit(EXIT_USAGE)
   end
   lines = File.readlines(DEFAULT_CONFIG)
   target_port = listen_port if target_port.nil? || target_port <= 0
-  removed = false
+  to_remove = []
+  lines.each do |l|
+    parsed = parse_config_line(l)
+    next unless parsed
+    next if udp_only && parsed[:protocol] != :udp
+    if parsed[:listen_port] == listen_port && parsed[:target_ip] == target_ip && (target_port <= 0 || parsed[:target_port] == target_port)
+      to_remove << parsed
+    end
+  end
+  if to_remove.empty?
+    warn "No matching forward: #{listen_port} -> #{target_ip}" + (udp_only ? ' (UDP)' : '')
+    exit(EXIT_NOT_FOUND)
+  end
+  # Remove all matching lines (TCP and UDP when both exist)
+  removed_protos = to_remove.map { |f| f[:protocol].to_s.upcase }.uniq
   lines.reject! do |l|
     parsed = parse_config_line(l)
     next false unless parsed
     next true if udp_only && parsed[:protocol] != :udp
-    match = parsed[:listen_port] == listen_port && parsed[:target_ip] == target_ip && (target_port <= 0 || parsed[:target_port] == target_port)
-    if match && !removed
-      removed = true
-      true
-    else
-      false
-    end
-  end
-  unless removed
-    warn "No matching forward: #{listen_port} -> #{target_ip}" + (udp_only ? ' (UDP)' : '')
-    exit 1
+    parsed[:listen_port] == listen_port && parsed[:target_ip] == target_ip && (target_port <= 0 || parsed[:target_port] == target_port)
   end
   File.write(DEFAULT_CONFIG, lines.join)
-  puts "Removed: #{listen_port} -> #{target_ip}:#{target_port}" + (udp_only ? ' (UDP)' : '')
-  if File.file?(SYSTEMD_UNIT)
-    system('systemctl', 'restart', 'wg-vpn-forward.service')
-    puts 'Restarted wg-vpn-forward.service'
-  end
+  msg = removed_protos.size == 1 ? "Removed #{removed_protos[0]}: #{listen_port} -> #{target_ip}:#{target_port}" : "Removed #{removed_protos.join(' and ')}: #{listen_port} -> #{target_ip}:#{target_port}"
+  puts msg
+  puts 'Restart to apply: systemctl restart wg-vpn-forward' if File.file?(SYSTEMD_UNIT)
 end
 
 def list_subcmd
@@ -281,15 +350,46 @@ def list_subcmd
     return
   end
   forwards = parse_config(path)
+  if File.file?(SYSTEMD_UNIT)
+    state = service_active? ? 'active' : 'inactive'
+    puts "Service: #{state}"
+  end
   if forwards.empty?
     puts 'No forwards configured.'
+    puts "Add one with: sudo #{$PROGRAM_NAME} add 4569 10.8.0.2"
     return
   end
   puts "Forwards (#{path}):"
-  forwards.each do |f|
+  forwards.each_with_index do |f, i|
     bind = f[:bind_addr] == '0.0.0.0' ? '0.0.0.0' : f[:bind_addr]
     proto = f[:protocol].to_s.upcase
-    puts "  #{proto} #{bind}:#{f[:listen_port]} -> #{f[:target_ip]}:#{f[:target_port]}"
+    puts "  #{i + 1}. #{proto} #{bind}:#{f[:listen_port]} -> #{f[:target_ip]}:#{f[:target_port]}"
+  end
+end
+
+def status_subcmd
+  if File.file?(SYSTEMD_UNIT)
+    state = service_active? ? 'active' : 'inactive'
+    puts "Service: #{state}"
+  else
+    puts 'Service: not installed (run install as root)'
+  end
+  path = DEFAULT_CONFIG
+  unless File.file?(path)
+    puts "Config: #{path} not found. Run: #{$PROGRAM_NAME} install"
+    return
+  end
+  forwards = parse_config(path)
+  if forwards.empty?
+    puts 'No forwards configured.'
+    puts "Add one with: sudo #{$PROGRAM_NAME} add 4569 10.8.0.2"
+    return
+  end
+  puts "Forwards (#{path}):"
+  forwards.each_with_index do |f, i|
+    bind = f[:bind_addr] == '0.0.0.0' ? '0.0.0.0' : f[:bind_addr]
+    proto = f[:protocol].to_s.upcase
+    puts "  #{i + 1}. #{proto} #{bind}:#{f[:listen_port]} -> #{f[:target_ip]}:#{f[:target_port]}"
   end
 end
 
@@ -302,7 +402,7 @@ while (arg = args.shift)
     config_path = args.shift || DEFAULT_CONFIG
   when '-h', '--help'
     usage
-    exit 0
+    exit(0)
   else
     args.unshift(arg)
     break
@@ -322,37 +422,18 @@ when 'remove'
 when 'list'
   args.shift
   list_subcmd
+when 'status'
+  args.shift
+  status_subcmd
 when nil, ''
   # Daemon mode only when --config was given (e.g. by systemd)
   if ARGV.include?('--config')
     daemon_mode(config_path)
   else
     usage
-    exit 1
+    exit(EXIT_USAGE)
   end
 else
-  # One-off run: [--udp] [--bind ADDR] PORT TARGET_IP [TARGET_PORT]
-  bind_addr = '0.0.0.0'
-  udp = false
-  while (arg = args.shift)
-    case arg
-    when '--bind' then bind_addr = args.shift || (usage; exit(1))
-    when '--udp'  then udp = true
-    when /^\d+$/ then args.unshift(arg); break
-    else args.unshift(arg); break
-    end
-  end
-  listen_port = args[0]&.to_i
-  target_ip   = args[1]
-  target_port = (args[2] || listen_port)&.to_i
-  if listen_port.nil? || listen_port <= 0 || target_ip.to_s.empty? || target_port.nil? || target_port <= 0
-    usage
-    exit 1
-  end
-  puts 'Press Ctrl+C to stop.'
-  if udp
-    run_one_udp_forward(bind_addr, listen_port, target_ip, target_port)
-  else
-    run_one_tcp_forward(bind_addr, listen_port, target_ip, target_port)
-  end
+  usage
+  exit(EXIT_USAGE)
 end
