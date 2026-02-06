@@ -162,9 +162,11 @@ sudo ./wg-vpn.rb show-key
 | Command | Description |
 |--------|-------------|
 | `setup [config_path]` | Install wireguard, copy config to `/etc/wireguard`, bring up tunnel, optionally enable on boot |
-| `up [interface]` | Bring up tunnel (default: wg0) |
-| `down [interface]` | Bring down tunnel (default: wg0) |
-| `status [interface]` | Show `wg show` (default: wg0) |
+| `up [interface]` | Bring up tunnel (default: auto-detect from `/etc/wireguard`) |
+| `down [interface]` | Bring down tunnel (default: auto-detect) |
+| `status [interface]` | Show `wg show` (default: auto-detect) |
+| `enable-boot [interface]` | Enable systemd service to start tunnel on boot (default: auto-detect) |
+| `disable-boot [interface]` | Disable systemd service for tunnel on boot (default: auto-detect) |
 
 **Example (first-time setup on a Debian client):**
 
@@ -178,7 +180,7 @@ sudo ./wg-vpn.rb show-key
    Or run `sudo ./wg-vpn-client.rb setup` and enter the path when prompted.
 3. Say **y** when asked to enable on boot if you want the tunnel to start automatically.
 
-The interface name is taken from the config filename (e.g. `work-laptop.conf` → interface `work-laptop`). To bring it down later: `sudo ./wg-vpn-client.rb down work-laptop`.
+The interface name is taken from the config filename (e.g. `work-laptop.conf` → interface `work-laptop`). When no interface is specified, `up`, `down`, `status`, `enable-boot`, and `disable-boot` auto-detect it from `/etc/wireguard/*.conf` (single config) or from the currently up interface. To bring it down: `sudo ./wg-vpn-client.rb down` or `sudo ./wg-vpn-client.rb down work-laptop`. To enable on boot later (without re-running setup): `sudo ./wg-vpn-client.rb enable-boot`.
 
 ---
 
