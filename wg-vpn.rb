@@ -245,6 +245,7 @@ def add_client(server_endpoint = nil, client_name = nil, route_all_traffic = nil
     PublicKey = #{server_pub}
     Endpoint = #{endpoint}
     AllowedIPs = #{allowed_ips}
+    PersistentKeepalive = 25
   CLIENT
   File.write(client_conf_path, client_conf)
   FileUtils.chmod(0o600, client_conf_path)

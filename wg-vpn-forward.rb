@@ -6,6 +6,7 @@
 # Managed by systemd on Debian: install once, add forwards to config, start/stop with systemctl.
 
 require 'socket'
+require 'timeout'
 
 DEFAULT_CONFIG = '/etc/wg-vpn-forward.conf'
 SYSTEMD_UNIT   = '/etc/systemd/system/wg-vpn-forward.service'
@@ -13,6 +14,10 @@ SYSTEMD_UNIT   = '/etc/systemd/system/wg-vpn-forward.service'
 EXIT_USAGE      = 1
 EXIT_NOT_FOUND  = 2
 EXIT_PERMISSION = 3
+
+# --- Simple hardening knobs ---
+TCP_IDLE_TIMEOUT = 300        # seconds before killing stalled TCP streams
+UDP_SESSION_TTL  = 60         # seconds before expiring UDP "connections"
 
 def script_path
   File.expand_path(File.realpath(__FILE__))
@@ -96,13 +101,25 @@ end
 
 def relay_tcp(client, target)
   threads = [
-    Thread.new { IO.copy_stream(client, target) },
-    Thread.new { IO.copy_stream(target, client) }
+    Thread.new do
+      begin
+        Timeout.timeout(TCP_IDLE_TIMEOUT) { IO.copy_stream(client, target) }
+      rescue Timeout::Error
+        warn "[wg-vpn-forward] TCP client->target idle timeout"
+      end
+    end,
+    Thread.new do
+      begin
+        Timeout.timeout(TCP_IDLE_TIMEOUT) { IO.copy_stream(target, client) }
+      rescue Timeout::Error
+        warn "[wg-vpn-forward] TCP target->client idle timeout"
+      end
+    end
   ]
   threads.each(&:join)
 ensure
-  client.close
-  target.close
+  client.close rescue nil
+  target.close rescue nil
 end
 
 def run_one_tcp_forward(bind_addr, listen_port, target_host, target_port)
@@ -111,11 +128,13 @@ def run_one_tcp_forward(bind_addr, listen_port, target_host, target_port)
   loop do
     client = server.accept
     Thread.new do
-      target = TCPSocket.new(target_host, target_port)
-      relay_tcp(client, target)
-    rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::ENETUNREACH => e
-      warn "Forward failed: #{e.message}"
-      client.close
+      begin
+        target = TCPSocket.new(target_host, target_port)
+        relay_tcp(client, target)
+      rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::ENETUNREACH => e
+        warn "Forward failed: #{e.message}"
+        client.close rescue nil
+      end
     end
   end
 rescue Errno::EADDRINUSE => e
@@ -124,27 +143,47 @@ rescue Errno::EADDRINUSE => e
 end
 
 def relay_udp(listen_sock, target_host, target_port)
-  client_sockets = {}   # [addr, port] -> UDPSocket connected to target
+  client_sockets = {}    # [addr, port] -> UDPSocket
   target_to_client = {} # UDPSocket -> [addr, port]
+  last_seen = {}        # [addr, port] -> Time
+
   loop do
     socks = [listen_sock] + client_sockets.values
-    readable, = IO.select(socks)
+    readable, = IO.select(socks, nil, nil, 1.0)
+
+    # Periodic cleanup of stale UDP "sessions"
+    now = Time.now
+    last_seen.each do |key, ts|
+      if now - ts > UDP_SESSION_TTL
+        sock = client_sockets.delete(key)
+        target_to_client.delete(sock)
+        last_seen.delete(key)
+        sock&.close rescue nil
+      end
+    end
+
+    next unless readable
+
     readable.each do |sock|
       if sock == listen_sock
-        data, sender = listen_sock.recvfrom(65535)
+        data, sender = listen_sock.recvfrom(65_535)
         key = [sender[0], sender[1]]
+        last_seen[key] = Time.now
+
         unless client_sockets[key]
           tsock = UDPSocket.new
           tsock.connect(target_host, target_port)
           client_sockets[key] = tsock
           target_to_client[tsock] = key
         end
+
         client_sockets[key].send(data, 0)
       else
-        data = sock.recv(65535)
+        data = sock.recv(65_535)
         break if data.empty?
         addr, port = target_to_client[sock]
         listen_sock.send(data, 0, addr, port)
+        last_seen[[addr, port]] = Time.now
       end
     end
   end
