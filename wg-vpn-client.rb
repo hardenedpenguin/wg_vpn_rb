@@ -1,146 +1,100 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# WireGuard VPN Client Setup (Ruby)
-# Debian only: install wireguard, copy config, bring up tunnel, optional enable on boot.
-# Requires: root, Debian.
-
 require 'fileutils'
 
 WG_DIR = '/etc/wireguard'
 
-def run(*cmd, **opts)
-  system(*cmd, **opts) || (raise "Command failed: #{cmd.join(' ')}")
+def info(msg); puts "\e[32m[INFO]\e[0m #{msg}"; end
+def warn(msg); puts "\e[33m[WARN]\e[0m #{msg}"; end
+def error(msg); puts "\e[31m[ERROR]\e[0m #{msg}"; exit 1; end
+
+def run(*cmd)
+  success = system(*cmd)
+  error "Command failed: #{cmd.join(' ')}" unless success
 end
 
 def root_check
-  return if Process.uid == 0
-  warn 'This script must be run as root (e.g. sudo).'
-  exit 1
+  error 'This script must be run as root (sudo).' unless Process.uid == 0
 end
 
 def debian_check
-  return if File.file?('/etc/debian_version')
-  warn 'This script is for Debian only.'
-  exit 1
+  error 'This script is for Debian-based systems only.' unless File.file?('/etc/debian_version')
 end
 
-def ask(prompt)
-  print prompt
-  $stdin.gets&.strip || ''
+def installed?
+  system('command -v wg > /dev/null 2>&1')
 end
 
 def default_interface
   confs = Dir[File.join(WG_DIR, '*.conf')].map { |p| File.basename(p, '.conf') }
   return 'wg0' if confs.empty?
   return confs.first if confs.size == 1
-  up = `wg show interfaces 2>/dev/null`.split
-  (confs & up).first || confs.first
+  
+  active = `wg show interfaces 2>/dev/null`.split
+  (confs & active).first || confs.first
 end
 
 def setup(config_path = nil)
   root_check
   debian_check
 
-  config_path ||= ask('Path to client config file: ').strip
-  raise 'Config path required' if config_path.empty?
-  config_path = File.expand_path(config_path)
-  raise "Config file not found: #{config_path}" unless File.file?(config_path)
+  unless installed?
+    info 'Installing WireGuard and dependencies...'
+    run('apt-get', 'update')
+    run('apt-get', 'install', '-y', 'wireguard', 'resolvconf')
+  end
 
-  puts 'Installing wireguard...'
-  run('apt-get', 'update', exception: true)
-  run('apt-get', 'install', '-y', 'wireguard', exception: true)
+  config_path ||= (print 'Path to client config file: '; $stdin.gets&.strip)
+  error 'Config path required' if config_path.nil? || config_path.empty?
+  
+  config_path = File.expand_path(config_path)
+  error "Config file not found: #{config_path}" unless File.file?(config_path)
 
   FileUtils.mkdir_p(WG_DIR)
   FileUtils.chmod(0o700, WG_DIR)
 
-  base = File.basename(config_path)
-  base += '.conf' unless base.end_with?('.conf')
-  dest = File.join(WG_DIR, base)
-  interface = base.chomp('.conf')
+  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_]/, '')
+  dest = File.join(WG_DIR, "#{base_name}.conf")
 
-  FileUtils.cp(config_path, dest, preserve: true)
-  FileUtils.chmod(0o600, dest)
-  puts "Config copied to #{dest}"
+  run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)
+  info "Config secured at #{dest}"
 
-  puts "Bringing up #{interface}..."
-  run('wg-quick', 'up', interface, exception: true)
+  run('wg-quick', 'up', base_name)
 
-  ans = ask('Enable WireGuard on boot? [y/N]: ').strip.downcase
-  if ans == 'y' || ans == 'yes'
-    run('systemctl', 'enable', "wg-quick@#{interface}", exception: true)
-    puts "Enabled wg-quick@#{interface} on boot."
+  print "Enable WireGuard on boot? [y/N]: "
+  if $stdin.gets&.strip&.downcase == 'y'
+    run('systemctl', 'enable', "wg-quick@#{base_name}")
+    info "Enabled wg-quick@#{base_name} on boot."
   end
 
-  puts "\nDone. Tunnel #{interface} is up."
-  puts "To bring down later: sudo #{$0} down #{interface}"
+  info "Done. Tunnel #{base_name} is active."
+  run('wg', 'show', base_name)
 end
 
-def up(interface = nil)
-  root_check
-  interface ||= ARGV[1]
-  interface ||= default_interface
-  run('wg-quick', 'up', interface, exception: true)
-  puts "#{interface} is up."
-end
+def up(interface);   root_check; run('wg-quick', 'up', interface || default_interface); end
+def down(interface); root_check; run('wg-quick', 'down', interface || default_interface); end
 
-def down(interface = nil)
-  root_check
-  interface ||= ARGV[1]
-  interface ||= default_interface
-  run('wg-quick', 'down', interface, exception: true)
-  puts "#{interface} is down."
-end
+command = ARGV.shift
+target  = ARGV.shift
 
-def status(interface = nil)
-  root_check
-  interface ||= ARGV[1]
-  interface ||= default_interface
-  run('wg', 'show', interface, exception: true)
-end
-
-def enable_boot(interface = nil)
-  root_check
-  interface ||= ARGV[1]
-  interface ||= default_interface
-  conf = File.join(WG_DIR, "#{interface}.conf")
-  raise "Config not found: #{conf}" unless File.file?(conf)
-  run('systemctl', 'enable', "wg-quick@#{interface}", exception: true)
-  puts "Enabled wg-quick@#{interface} on boot."
-end
-
-def disable_boot(interface = nil)
-  root_check
-  interface ||= ARGV[1]
-  interface ||= default_interface
-  run('systemctl', 'disable', "wg-quick@#{interface}", exception: true)
-  puts "Disabled wg-quick@#{interface} on boot."
-end
-
-# Subcommands
-case ARGV[0]
-when 'setup'
-  setup(ARGV[1])
-when 'up'
-  up
-when 'down'
-  down
-when 'status'
-  status
-when 'enable-boot'
-  enable_boot
-when 'disable-boot'
-  disable_boot
-when nil, ''
-  puts "Usage: #{$0} setup [config_path] | up [interface] | down [interface] | status [interface] | enable-boot [interface] | disable-boot [interface]"
-  puts '  setup       - Install wireguard, copy config to /etc/wireguard, bring up tunnel (default interface: from config filename)'
-  puts '  up          - Bring up tunnel (default: auto-detect from /etc/wireguard)'
-  puts '  down        - Bring down tunnel (default: auto-detect)'
-  puts '  status      - Show wg show (default: auto-detect)'
-  puts '  enable-boot - Enable systemd service to start tunnel on boot (default: auto-detect)'
-  puts '  disable-boot- Disable systemd service for tunnel on boot (default: auto-detect)'
-  exit 1
+case command
+when 'setup'        then setup(target)
+when 'up'           then up(target)
+when 'down'         then down(target)
+when 'status'       then run('wg', 'show', target || default_interface)
+when 'enable-boot'  then run('systemctl', 'enable', "wg-quick@#{target || default_interface}")
+when 'disable-boot' then run('systemctl', 'disable', "wg-quick@#{target || default_interface}")
 else
-  puts "Usage: #{$0} [ setup [config_path] | up [interface] | down [interface] | status [interface] | enable-boot [interface] | disable-boot [interface] ]"
-  exit 1
+  puts <<~USAGE
+    Usage: #{$0} [command] [interface/path]
+
+    Commands:
+      setup [path]      Install WireGuard and import config
+      up [iface]        Bring up tunnel
+      down [iface]      Bring down tunnel
+      status [iface]    Show WireGuard status
+      enable-boot       Enable autostart on boot
+      disable-boot      Disable autostart on boot
+  USAGE
 end
