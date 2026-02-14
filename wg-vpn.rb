@@ -1,12 +1,12 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# WireGuard VPN Manager (Ruby)
-# Single script for server setup and client management.
-# Requires: root, Debian with wireguard + firewalld (+ qrencode for QR).
+# WireGuard VPN Manager (Ruby) - Optimized for ASL3 & CGNAT Bypass
+# Requires: root, Debian/Ubuntu, wireguard, firewalld, qrencode.
 
 require 'fileutils'
 require 'open3'
+require 'tempfile'
 
 WG_DIR = '/etc/wireguard'
 WG_CLIENTS = File.join(WG_DIR, 'clients')
@@ -16,26 +16,12 @@ SERVER_PUB = File.join(WG_DIR, 'server.pub')
 VPN_SUBNET = '10.8.0.0/24'
 VPN_SERVER_IP = '10.8.0.1'
 WG_PORT = 51820
-CLIENT_DNS = '1.1.1.1'  # DNS in generated client configs; change if desired
+CLIENT_DNS = '1.1.1.1'
+# 1420 is the standard for WireGuard; safe for IAX2/ASL3 audio packets.
+DEFAULT_MTU = 1420
 
 def run(*cmd, **opts)
   system(*cmd, **opts) || (raise "Command failed: #{cmd.join(' ')}")
-end
-
-# WireGuard requires "Key = Value" (spaces around =). Normalize every key=value line.
-def normalize_wg_config(content)
-  content = content.delete("\r")
-  content.each_line.map do |line|
-    line = line.chomp
-    # Match Key=Value (no space) or Key = Value -> output "Key = Value"
-    if line =~ /\A(\s*)([A-Za-z][A-Za-z0-9]*)=(\S.*)\z/
-      "#{$1}#{$2} = #{$3.strip}\n"
-    elsif line =~ /\A(\s*)([A-Za-z][A-Za-z0-9]*)\s+=\s+(.*)\z/
-      "#{$1}#{$2} = #{$3.strip}\n"
-    else
-      "#{line}\n"
-    end
-  end.join
 end
 
 def capture(*cmd, **opts)
@@ -44,47 +30,32 @@ def capture(*cmd, **opts)
   out.strip
 end
 
-# Parse server config: peer public key -> client IP (from AllowedIPs 10.8.0.x/32).
-def peer_pubkey_to_ip
-  return {} unless File.file?(WG_CONF)
-  h = {}
-  File.read(WG_CONF).scan(/\[Peer\](.*?)(?=\[Peer\]|\z)/m).each do |block|
-    pub = block[0][/PublicKey\s*=\s*(\S+)/, 1]
-    allowed = block[0][/AllowedIPs\s*=\s*10\.8\.0\.(\d+)/, 1]
-    h[pub] = "10.8.0.#{allowed}" if pub && allowed
-  end
-  h
+# Format "Key=Value" to "Key = Value" for WireGuard standards
+def normalize_wg_config(content)
+  content.gsub(/\r/, '').each_line.map do |line|
+    if line =~ /\A(\s*)([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)\z/
+      "#{$1}#{$2} = #{$3.strip}\n"
+    else
+      line
+    end
+  end.join
 end
 
-# Client config: ip (no CIDR) -> name. Use plain IP so it matches peer_pubkey_to_ip.
-def client_ip_to_name
-  return {} unless File.directory?(WG_CLIENTS)
-  Dir[File.join(WG_CLIENTS, '*.conf')].each_with_object({}) do |f, h|
-    ip = File.read(f)[/Address\s*=\s*(\d+\.\d+\.\d+\.\d+)/, 1] rescue nil
-    h[ip] = File.basename(f, '.conf') if ip
-  end
-end
-
-def handshake_age(ts)
-  return 'never' if ts.nil? || ts.to_i <= 0
-  sec = Time.now.to_i - ts.to_i
-  return "#{sec}s ago" if sec < 60
-  return "#{sec / 60} min ago" if sec < 3600
-  return "#{sec / 3600} h ago" if sec < 86400
-  "#{sec / 86400} days ago"
-end
-
-# Apply server config. wg syncconf only accepts kernel keys (PrivateKey, ListenPort);
-# Address/DNS are wg-quick extensions, so we use wg-quick reload (full config) or
-# wg-quick strip + wg syncconf as fallback.
+# Apply server config live without dropping connections
 def apply_wg0_conf
   return unless File.file?(WG_CONF)
   return unless capture('wg', 'show', 'interfaces').include?('wg0')
-  # Prefer wg-quick reload so full config (Address, etc.) is applied
-  run('systemctl', 'reload', 'wg-quick@wg0', exception: true)
-rescue StandardError
-  # Fallback: strip wg-quick-only keys, then wg syncconf (requires bash process substitution)
-  run('bash', '-c', "wg syncconf wg0 <(wg-quick strip #{WG_CONF})", exception: true)
+
+  # wg syncconf updates peers live without affecting existing sessions.
+  Tempfile.open('wg_sync') do |f|
+    stripped = capture('wg-quick', 'strip', WG_CONF)
+    f.write(stripped)
+    f.flush
+    run('wg', 'syncconf', 'wg0', f.path)
+  end
+rescue StandardError => e
+  warn "Live sync failed, restarting service: #{e.message}"
+  run('systemctl', 'restart', 'wg-quick@wg0')
 end
 
 def root_check
@@ -94,9 +65,8 @@ def root_check
 end
 
 def ensure_dirs
-  FileUtils.mkdir_p(WG_CLIENTS)
+  FileUtils.mkdir_p(WG_CLIENTS, mode: 0o700)
   FileUtils.chmod(0o700, WG_DIR)
-  FileUtils.chmod(0o700, WG_CLIENTS)
 end
 
 def genkey
@@ -113,55 +83,37 @@ end
 
 def next_client_ip
   used = []
-  return "#{VPN_SERVER_IP.sub(/\.\d+$/, '')}.2" if !File.file?(WG_CONF)
-
-  File.read(WG_CONF).scan(/AllowedIPs\s*=\s*10\.8\.0\.(\d+)/).each do |m|
-    used << m[0].to_i
-  end
-  Dir[File.join(WG_CLIENTS, '*.conf')].each do |f|
-    c = File.read(f)
-    c.scan(/Address\s*=\s*10\.8\.0\.(\d+)/).each { |m| used << m[0].to_i }
-  rescue Errno::EACCES, Errno::ENOENT
-    next
+  if File.file?(WG_CONF)
+    File.read(WG_CONF).scan(/AllowedIPs\s*=\s*10\.8\.0\.(\d+)/).each { |m| used << m[0].to_i }
   end
   n = (2..254).find { |i| !used.include?(i) } || (raise 'No free client IP in 10.8.0.0/24')
   "10.8.0.#{n}"
 end
 
-def server_keys_exist?
-  File.file?(SERVER_KEY) && File.file?(SERVER_PUB)
-end
-
 def ensure_server_keys
-  return if server_keys_exist?
+  return if File.file?(SERVER_KEY) && File.file?(SERVER_PUB)
   ensure_dirs
   priv = genkey
   pub = pubkey(priv)
-  File.write(SERVER_KEY, priv)
-  File.write(SERVER_PUB, pub)
-  FileUtils.chmod(0o600, SERVER_KEY)
-  FileUtils.chmod(0o600, SERVER_PUB)
+  # Security: Write with 0600 mode immediately
+  File.open(SERVER_KEY, 'w', 0o600) { |f| f.write(priv) }
+  File.open(SERVER_PUB, 'w', 0o600) { |f| f.write(pub) }
   pub
 end
 
 def setup_server
   root_check
-  puts 'Installing packages (wireguard, firewalld, qrencode)...'
-  run('apt-get', 'update', exception: true)
-  run('apt-get', 'install', '-y', 'wireguard', 'firewalld', 'qrencode', exception: true)
+  puts 'Installing requirements...'
+  run('apt-get', 'update')
+  run('apt-get', 'install', '-y', 'wireguard', 'firewalld', 'qrencode')
 
   puts 'Enabling IP forwarding...'
-  run('sysctl', '-w', 'net.ipv4.ip_forward=1', exception: true)
-  sysctl_conf = '/etc/sysctl.d/99-wireguard.conf'
-  line = "net.ipv4.ip_forward=1"
-  unless File.file?(sysctl_conf) && File.read(sysctl_conf).include?(line)
-    File.open(sysctl_conf, 'a') { |f| f.puts line }
-  end
+  File.open('/etc/sysctl.d/99-wireguard.conf', 'w') { |f| f.puts "net.ipv4.ip_forward=1" }
+  run('sysctl', '-p', '/etc/sysctl.d/99-wireguard.conf')
 
   ensure_dirs
-  pub = ensure_server_keys
+  ensure_server_keys
 
-  # Build or update server config
   conf = <<~CONF
     [Interface]
     Address = #{VPN_SERVER_IP}/24
@@ -170,28 +122,20 @@ def setup_server
   CONF
 
   if File.file?(WG_CONF)
-    # Keep existing [Peer] blocks
-    peer_section = File.read(WG_CONF).split(/^\[Peer\]/).drop(1).map { |p| '[Peer]' + p }.join
-    conf << peer_section
+    peers = File.read(WG_CONF).split(/^\[Peer\]/).drop(1).map { |p| "[Peer]#{p}" }.join
+    conf << peers
   end
 
-  File.write(WG_CONF, normalize_wg_config(conf))
-  FileUtils.chmod(0o600, WG_CONF)
+  File.open(WG_CONF, 'w', 0o600) { |f| f.write(normalize_wg_config(conf)) }
 
-  puts 'Configuring firewalld (UDP 51820, masquerade, trusted wg0)...'
-  run('firewall-cmd', '--permanent', '--add-port', "#{WG_PORT}/udp", exception: true)
-  run('firewall-cmd', '--permanent', '--add-masquerade', exception: true)
-  run('firewall-cmd', '--reload', exception: true)
+  puts 'Configuring firewall...'
+  run('firewall-cmd', '--permanent', '--add-port', "#{WG_PORT}/udp")
+  run('firewall-cmd', '--permanent', '--add-masquerade')
+  run('firewall-cmd', '--permanent', '--zone=trusted', '--add-interface=wg0')
+  run('firewall-cmd', '--reload')
 
-  run('systemctl', 'enable', '--now', 'wg-quick@wg0', exception: true)
-
-  # Allow client-to-client: put wg0 in trusted zone so forwarded VPN traffic is accepted
-  run('firewall-cmd', '--permanent', '--zone=trusted', '--add-interface=wg0', exception: true)
-  run('firewall-cmd', '--reload', exception: true)
-
+  run('systemctl', 'enable', '--now', 'wg-quick@wg0')
   puts "\nServer setup complete."
-  puts "Server public key: #{pub}"
-  puts "\nRouter: forward UDP #{WG_PORT} -> this host."
 end
 
 def add_client(server_endpoint = nil, client_name = nil, route_all_traffic = nil)
@@ -199,167 +143,129 @@ def add_client(server_endpoint = nil, client_name = nil, route_all_traffic = nil
   ensure_dirs
   ensure_server_keys
 
-  # Fix server config format first (Address=... -> Address = ...)
-  if File.file?(WG_CONF)
-    raw = File.read(WG_CONF)
-    fixed = normalize_wg_config(raw)
-    if raw != fixed
-      File.write(WG_CONF, fixed)
-      apply_wg0_conf
-    end
-  end
-
   server_endpoint ||= ask('VPN server public IP or hostname: ')
-  client_name ||= ask('Client name (e.g. work-laptop): ')
+  client_name ||= ask('Client name (e.g. asl-node-1): ')
   client_name = client_name.strip.gsub(/\s+/, '-')
-  raise 'Client name required' if client_name.empty?
-
-  # Route all traffic through VPN? (prompt if not given on CLI)
-  route_all = route_all_traffic
-  if route_all.nil?
-    ans = ask('Route all traffic through VPN? [y/N]: ').strip.downcase
-    route_all = (ans == 'y' || ans == 'yes')
+  
+  client_conf_path = File.join(WG_CLIENTS, "#{client_name}.conf")
+  
+  if File.file?(client_conf_path)
+    puts "Client #{client_name} exists. Overwriting entry..."
+    remove_peer_from_server_config(client_name)
   end
-  allowed_ips = route_all ? '0.0.0.0/0, ::/0' : '10.8.0.0/24'
+
+  route_all = route_all_traffic.nil? ? (ask('Route all traffic through VPN? [y/N]: ').downcase == 'y') : route_all_traffic
+  allowed_ips = route_all ? '0.0.0.0/0, ::/0' : VPN_SUBNET
 
   client_priv = genkey
   client_pub = pubkey(client_priv)
   client_ip = next_client_ip
 
-  client_conf_path = File.join(WG_CLIENTS, "#{client_name}.conf")
-  if File.file?(client_conf_path)
-    puts "Client #{client_name} already exists. Overwrite? [y/N]"
-    exit 1 unless $stdin.gets.strip.downcase == 'y'
-  end
-
-  # Client config
-  server_pub = File.read(SERVER_PUB).strip
-  endpoint = server_endpoint.include?(':') ? server_endpoint : "#{server_endpoint}:#{WG_PORT}"
   client_conf = <<~CLIENT
     [Interface]
     PrivateKey = #{client_priv}
     Address = #{client_ip}/24
     DNS = #{CLIENT_DNS}
+    MTU = #{DEFAULT_MTU}
 
     [Peer]
-    PublicKey = #{server_pub}
-    Endpoint = #{endpoint}
+    PublicKey = #{File.read(SERVER_PUB).strip}
+    Endpoint = #{server_endpoint.include?(':') ? server_endpoint : "#{server_endpoint}:#{WG_PORT}"}
     AllowedIPs = #{allowed_ips}
+    # Critical for CGNAT bypass:
     PersistentKeepalive = 25
   CLIENT
-  File.write(client_conf_path, client_conf)
-  FileUtils.chmod(0o600, client_conf_path)
 
-  # Append peer to server config (read, normalize, append, write so format is correct)
-  current = File.read(WG_CONF)
-  peer_block = <<~PEER
+  File.open(client_conf_path, 'w', 0o600) { |f| f.write(client_conf) }
 
-    [Peer]
-    PublicKey = #{client_pub}
-    AllowedIPs = #{client_ip}/32
-  PEER
-  File.write(WG_CONF, normalize_wg_config(current + peer_block))
+  peer_block = "\n[Peer]\n# Name = #{client_name}\nPublicKey = #{client_pub}\nAllowedIPs = #{client_ip}/32\n"
+  File.open(WG_CONF, 'a') { |f| f.write(normalize_wg_config(peer_block)) }
 
-  # Reload WireGuard so new peer is applied
   apply_wg0_conf
 
-  puts "\nClient config written: #{client_conf_path}"
-  puts "Client VPN IP: #{client_ip}"
-  puts '(All traffic will route through VPN.)' if route_all
-  if system('which', 'qrencode', out: File::NULL, err: File::NULL)
-    puts "\nQR code (scan with WireGuard app):"
-    run('qrencode', '-t', 'ansiutf8', '-r', client_conf_path, exception: false)
+  puts "\nClient config saved to: #{client_conf_path}"
+  if system('which qrencode > /dev/null')
+    puts "QR Code for mobile/tablet:"
+    run('qrencode', '-t', 'ansiutf8', '-r', client_conf_path)
   end
+end
+
+def remove_peer_from_server_config(name)
+  return unless File.file?(WG_CONF)
+  
+  client_file = File.join(WG_CLIENTS, "#{name}.conf")
+  client_ip = File.read(client_file)[/Address\s*=\s*(\d+\.\d+\.\d+\.\d+)/, 1] if File.file?(client_file)
+
+  blocks = File.read(WG_CONF).split(/(?=\[Peer\])/)
+  header = blocks.shift
+  
+  filtered_peers = blocks.reject do |b| 
+    (client_ip && b.include?("AllowedIPs = #{client_ip}/32")) || b.include?("# Name = #{name}")
+  end
+
+  File.open(WG_CONF, 'w', 0o600) { |f| f.write(header + filtered_peers.join) }
 end
 
 def remove_client(name = nil)
   root_check
   name ||= ask('Client name to remove: ')
-  name = name.strip
-  client_conf = File.join(WG_CLIENTS, "#{name}.conf")
-  unless File.file?(client_conf)
-    puts "No such client: #{name}"
-    exit 1
-  end
-  client_ip = File.read(client_conf)[/Address\s*=\s*(\S+)/, 1]
-  unless client_ip
-    puts 'Could not determine client IP from config.'
-    exit 1
-  end
+  remove_peer_from_server_config(name)
+  
+  client_file = File.join(WG_CLIENTS, "#{name}.conf")
+  File.delete(client_file) if File.file?(client_file)
+  
+  apply_wg0_conf
+  puts "Removed client: #{name}"
+end
 
-  # Remove peer block from server config (entire [Peer] block that contains this client's AllowedIPs)
-  content = File.read(WG_CONF)
-  blocks = content.split(/(?=\[Peer\])/).reject(&:empty?)
-  interface_part = blocks[0] || ''
-  peer_blocks = blocks[1..] || []
-  target_ip_pattern = /AllowedIPs\s*=\s*#{Regexp.escape(client_ip)}\/\d+/
-  peer_blocks_to_keep = peer_blocks.reject { |b| b =~ target_ip_pattern }
-  if peer_blocks_to_keep.size < peer_blocks.size
-    new_content = ([interface_part] + peer_blocks_to_keep).join("\n").gsub(/\n{3,}/, "\n\n")
-    File.write(WG_CONF, normalize_wg_config(new_content))
-    File.delete(client_conf)
-    apply_wg0_conf
-    puts "Removed client: #{name}"
+def port_forward_menu
+  root_check
+  puts "\n--- Port Forwarding (NAT) ---"
+  
+  ext_iface = ask('Public interface (e.g. eth0): ')
+  ext_iface = 'eth0' if ext_iface.empty?
+  
+  dest_ip = ask('Internal Client VPN IP (e.g. 10.8.0.2): ')
+  return puts "Error: Destination IP required." if dest_ip.empty?
+
+  port = ask('Port to forward (ASL3 uses 4569): ').to_i
+  proto = ask('Protocol (udp/tcp): ').downcase
+  proto = 'udp' if proto.empty? # Default to UDP for IAX2
+
+  if system('systemctl is-active --quiet firewalld')
+    # Firewalld Duplicate Check
+    rule_spec = "port=#{port}:proto=#{proto}:toport=#{port}:toaddr=#{dest_ip}"
+    check_cmd = "firewall-cmd --permanent --zone=public --query-forward-port=#{rule_spec}"
+    
+    if system("#{check_cmd} >/dev/null 2>&1")
+      puts "Notice: This rule already exists in Firewalld. Skipping."
+    else
+      run('firewall-cmd', '--permanent', '--zone=public', "--add-forward-port=#{rule_spec}")
+      run('firewall-cmd', '--reload')
+      puts "Rule applied via Firewalld."
+    end
   else
-    puts 'Peer block not found in server config; removed config file only.'
-    File.delete(client_conf)
+    # Iptables Duplicate Check (using -C)
+    dnat_exists = system("iptables -t nat -C PREROUTING -i #{ext_iface} -p #{proto} --dport #{port} -j DNAT --to-destination #{dest_ip} 2>/dev/null")
+    fwd_exists = system("iptables -C FORWARD -p #{proto} -d #{dest_ip} --dport #{port} -j ACCEPT 2>/dev/null")
+
+    if dnat_exists && fwd_exists
+      puts "Notice: This rule already exists in Iptables. Skipping."
+    else
+      run('iptables', '-t', 'nat', '-I', 'PREROUTING', '-i', ext_iface, '-p', proto, '--dport', port.to_s, '-j', 'DNAT', '--to-destination', dest_ip) unless dnat_exists
+      run('iptables', '-I', 'FORWARD', '-p', proto, '-d', dest_ip, '--dport', port.to_s, '-j', 'ACCEPT') unless fwd_exists
+      puts "Rule applied via Iptables."
+    end
   end
 end
 
 def list_clients
-  root_check
-  if !File.directory?(WG_CLIENTS)
-    puts 'No clients directory.'
-    return
+  puts "\n--- Configured VPN Clients ---"
+  Dir[File.join(WG_CLIENTS, '*.conf')].each do |f|
+    name = File.basename(f, '.conf')
+    ip = File.read(f)[/Address\s*=\s*(\S+)/, 1]
+    puts "#{name.ljust(20)} | VPN IP: #{ip}"
   end
-  pub_to_ip = peer_pubkey_to_ip
-  ip_to_pub = pub_to_ip.invert
-  ip_to_name = client_ip_to_name
-  handshakes = {}
-  begin
-    capture('wg', 'show', 'wg0', 'latest-handshakes').each_line do |line|
-      pub, ts = line.split
-      handshakes[pub] = ts if pub && ts
-    end
-  rescue StandardError
-    # wg0 may be down or no peers
-  end
-
-  ip_to_name.each do |ip, name|
-    pub = ip_to_pub[ip]
-    ts = pub ? handshakes[pub] : nil
-    age = handshake_age(ts)
-    puts "  #{name}: #{ip}  (last seen: #{age})"
-  end
-  puts "\n(No recent handshake usually means client is down; WireGuard does not detect disconnect.)"
-end
-
-def show_connected
-  root_check
-  run('wg', 'show', 'wg0')
-end
-
-def monitor
-  root_check
-  puts 'Live monitor (press q to quit):'
-  script = <<~BASH
-    while true; do
-      clear
-      wg show wg0
-      read -t 2 -n 1 key || true
-      [[ "$key" == "q" || "$key" == "Q" ]] && break
-    done
-  BASH
-  run('bash', '-c', script.strip, exception: true)
-end
-
-def show_server_key
-  root_check
-  unless File.file?(SERVER_PUB)
-    puts 'Server not set up. Run: setup'
-    exit 1
-  end
-  puts File.read(SERVER_PUB).strip
 end
 
 def ask(prompt)
@@ -367,51 +273,30 @@ def ask(prompt)
   $stdin.gets&.strip || ''
 end
 
-def interactive_menu
+# CLI Router
+case ARGV[0]
+when 'setup'          then setup_server
+when 'add-client'     then add_client(ARGV[1], ARGV[2], ARGV[3] == 'full')
+when 'remove-client'  then remove_client(ARGV[1])
+when 'list'           then list_clients
+when nil, ''
   loop do
-    puts "\n--- WireGuard VPN Manager ---"
-    puts '1) Add Client'
-    puts '2) Remove Client'
-    puts '3) List Clients'
-    puts '4) Show Connected (wg show)'
-    puts '5) Live Monitor'
-    puts '6) Show Server Public Key'
-    puts '7) Exit'
-    print 'Choice: '
-    case $stdin.gets&.strip
+    puts "\n--- WireGuard Manager ---"
+    puts "1) Add Client (CGNAT Node)"
+    puts "2) Remove Client"
+    puts "3) List Clients"
+    puts "4) Show VPN Status"
+    puts "5) Port Forwarding (for Public ASL3 access)"
+    puts "6) Exit"
+    case ask('Choice: ')
     when '1' then add_client
     when '2' then remove_client
     when '3' then list_clients
-    when '4' then show_connected
-    when '5' then monitor
-    when '6' then show_server_key
-    when '7' then break
-    else puts 'Invalid option.'
+    when '4' then run('wg', 'show')
+    when '5' then port_forward_menu
+    when '6' then break
     end
   end
-end
-
-# Subcommands
-case ARGV[0]
-when 'setup'
-  setup_server
-when 'add-client'
-  route_all = !ARGV[3].to_s.strip.empty? && %w[full y yes 1].include?(ARGV[3].to_s.strip.downcase)
-  add_client(ARGV[1], ARGV[2], route_all ? true : nil)
-when 'remove-client'
-  remove_client(ARGV[1])
-when 'list-clients'
-  list_clients
-when 'show-connected'
-  show_connected
-when 'monitor'
-  monitor
-when 'show-key'
-  show_server_key
-when nil, ''
-  interactive_menu
 else
-  puts "Usage: #{$0} [ setup | add-client [server_ip] [name] [full] | remove-client [name] | list-clients | show-connected | monitor | show-key ]"
-  puts '  No args: interactive menu.'
-  exit 1
+  puts "Usage: #{$0} [setup | add-client | remove-client | list]"
 end
