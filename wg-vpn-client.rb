@@ -1,17 +1,25 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
+#
+# WireGuard VPN client setup for Debian.
+# Commands: setup [path] | up | down | status | enable-boot | disable-boot
+#
 
 require 'fileutils'
 
 WG_DIR = '/etc/wireguard'
 
-def info(msg); puts "\e[32m[INFO]\e[0m #{msg}"; end
-def warn(msg); puts "\e[33m[WARN]\e[0m #{msg}"; end
-def error(msg); puts "\e[31m[ERROR]\e[0m #{msg}"; exit 1; end
+def info(msg)
+  puts "\e[32m[INFO]\e[0m #{msg}"
+end
+
+def error(msg)
+  puts "\e[31m[ERROR]\e[0m #{msg}"
+  exit 1
+end
 
 def run(*cmd)
-  success = system(*cmd)
-  error "Command failed: #{cmd.join(' ')}" unless success
+  error "Command failed: #{cmd.join(' ')}" unless system(*cmd)
 end
 
 def root_check
@@ -26,15 +34,17 @@ def installed?
   system('command -v wg > /dev/null 2>&1')
 end
 
+# Interface name from config filename. With multiple configs, prefers the active one.
 def default_interface
   confs = Dir[File.join(WG_DIR, '*.conf')].map { |p| File.basename(p, '.conf') }
   return 'wg0' if confs.empty?
   return confs.first if confs.size == 1
-  
+
   active = `wg show interfaces 2>/dev/null`.split
   (confs & active).first || confs.first
 end
 
+# Install WireGuard, copy config to /etc/wireguard, bring up tunnel, optionally enable on boot.
 def setup(config_path = nil)
   root_check
   debian_check
@@ -47,7 +57,7 @@ def setup(config_path = nil)
 
   config_path ||= (print 'Path to client config file: '; $stdin.gets&.strip)
   error 'Config path required' if config_path.nil? || config_path.empty?
-  
+
   config_path = File.expand_path(config_path)
   error "Config file not found: #{config_path}" unless File.file?(config_path)
 
@@ -58,11 +68,12 @@ def setup(config_path = nil)
   dest = File.join(WG_DIR, "#{base_name}.conf")
 
   run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)
+  File.delete(config_path) if File.expand_path(config_path) != File.expand_path(dest)
   info "Config secured at #{dest}"
 
   run('wg-quick', 'up', base_name)
 
-  print "Enable WireGuard on boot? [y/N]: "
+  print 'Enable WireGuard on boot? [y/N]: '
   if $stdin.gets&.strip&.downcase == 'y'
     run('systemctl', 'enable', "wg-quick@#{base_name}")
     info "Enabled wg-quick@#{base_name} on boot."
@@ -72,29 +83,52 @@ def setup(config_path = nil)
   run('wg', 'show', base_name)
 end
 
-def up(interface);   root_check; run('wg-quick', 'up', interface || default_interface); end
-def down(interface); root_check; run('wg-quick', 'down', interface || default_interface); end
+def up(interface = nil)
+  root_check
+  run('wg-quick', 'up', interface || default_interface)
+end
+
+def down(interface = nil)
+  root_check
+  run('wg-quick', 'down', interface || default_interface)
+end
+
+def show_status(interface = nil)
+  root_check
+  run('wg', 'show', interface || default_interface)
+end
+
+def enable_boot(interface = nil)
+  root_check
+  run('systemctl', 'enable', "wg-quick@#{interface || default_interface}")
+end
+
+def disable_boot(interface = nil)
+  root_check
+  run('systemctl', 'disable', "wg-quick@#{interface || default_interface}")
+end
 
 command = ARGV.shift
-target  = ARGV.shift
+target = ARGV.shift
 
 case command
-when 'setup'        then setup(target)
-when 'up'           then up(target)
-when 'down'         then down(target)
-when 'status'       then run('wg', 'show', target || default_interface)
-when 'enable-boot'  then run('systemctl', 'enable', "wg-quick@#{target || default_interface}")
-when 'disable-boot' then run('systemctl', 'disable', "wg-quick@#{target || default_interface}")
+when 'setup'       then setup(target)
+when 'up'          then up(target)
+when 'down'        then down(target)
+when 'status'      then show_status(target)
+when 'enable-boot' then enable_boot(target)
+when 'disable-boot' then disable_boot(target)
 else
   puts <<~USAGE
-    Usage: #{$0} [command] [interface/path]
+    WireGuard VPN Client
+    Usage: #{$PROGRAM_NAME} <command> [interface]
 
     Commands:
-      setup [path]      Install WireGuard and import config
-      up [iface]        Bring up tunnel
-      down [iface]      Bring down tunnel
-      status [iface]    Show WireGuard status
-      enable-boot       Enable autostart on boot
-      disable-boot      Disable autostart on boot
+      setup [path]     Install WireGuard, import config, bring up tunnel
+      up [iface]       Bring up tunnel (auto-detect iface if single config)
+      down [iface]     Bring down tunnel
+      status [iface]   Show wg status
+      enable-boot      Enable tunnel on boot
+      disable-boot     Disable tunnel on boot
   USAGE
 end

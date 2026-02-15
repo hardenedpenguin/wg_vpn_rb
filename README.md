@@ -4,15 +4,6 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 
 ---
 
-## Requirements
-
-- **Root** (or `sudo`)
-- **Debian** (or Debian-based) system
-- Packages: **wireguard**, **firewalld**
-- Optional: **qrencode** (for QR codes when adding clients, for mobile WireGuard apps)
-
----
-
 ## How It Works
 
 ### Paths and defaults
@@ -34,7 +25,7 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 
 ### Setup (`setup`)
 
-1. Installs **wireguard**, **firewalld**, **qrencode** via `apt`.
+1. Installs **wireguard**, **firewalld**, **resolvconf**, **qrencode** via `apt`.
 2. Enables IPv4 forwarding (`net.ipv4.ip_forward=1`) in `/etc/sysctl.d/99-wireguard.conf`.
 3. Creates `/etc/wireguard` and `/etc/wireguard/clients`, generates server key pair if missing.
 4. Writes initial `wg0.conf` with `MTU = 1420` if it does not exist.
@@ -64,21 +55,29 @@ Forwards a port on the server’s WAN interface to a VPN client. **Preserves sou
 1. Adds a forward-port (DNAT) to the default zone.
 2. Adds a direct FORWARD rule so physical→virtual traffic is allowed.
 
-ASL3 clients behind CGNAT **must** have `PersistentKeepalive = 25` in their config.
-
 ---
 
 ## Usage
 
 Run as **root** (e.g. `sudo ./wg-vpn.rb ...`).
 
-### Commands
+### Interactive menu
+
+Run with no arguments for a menu:
+
+```bash
+sudo ./wg-vpn.rb
+```
+
+The menu prompts for each action. For port forwarding, it lists existing clients and asks for port, internal IP (with default), and protocol.
+
+### Commands (non-interactive)
 
 | Command   | Description |
 |-----------|-------------|
 | `setup`   | Install packages, configure firewall, create server config, start WireGuard |
 | `add-client` | Add a client; prompts for name |
-| `forward PORT INTERNAL_IP [proto]` | Port forward (default proto: udp). Preserves source IP for ASL3. |
+| `forward [PORT] [INTERNAL_IP] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
 | `status`  | Show `wg show` |
 
 ### Examples
@@ -127,20 +126,20 @@ sudo ./wg-vpn.rb status
 
 ## Client script (Debian)
 
-**wg-vpn-client.rb** is a client-side script for **Debian**. It installs WireGuard, copies your client config into `/etc/wireguard`, brings up the tunnel, and optionally enables it on boot.
+**wg-vpn-client.rb** is a client-side script for **Debian**. It installs WireGuard, copies your client config into `/etc/wireguard`, removes the source file (so only the secured copy remains), brings up the tunnel, and optionally enables it on boot.
 
 **Requirements:** root, Debian.
 
 **Commands:**
 
-| Command        | Description |
-|----------------|-------------|
-| `setup [path]` | Install WireGuard, copy config, bring up tunnel, optionally enable on boot |
-| `up [interface]` | Bring up tunnel (default: auto-detect) |
-| `down [interface]` | Bring down tunnel (default: auto-detect) |
-| `status [interface]` | Show `wg show` (default: auto-detect) |
-| `enable-boot [interface]` | Enable systemd service on boot (default: auto-detect) |
-| `disable-boot [interface]` | Disable systemd service on boot (default: auto-detect) |
+| Command           | Description |
+|-------------------|-------------|
+| `setup [path]`    | Install WireGuard, copy config to `/etc/wireguard` (source removed), bring up tunnel, optionally enable on boot |
+| `up [interface]`  | Bring up tunnel (auto-detect interface if single config) |
+| `down [interface]`| Bring down tunnel |
+| `status [interface]` | Show `wg show` |
+| `enable-boot [interface]` | Enable tunnel on boot |
+| `disable-boot [interface]` | Disable tunnel on boot |
 
 **Example (first-time setup on a Debian client):**
 
@@ -151,7 +150,7 @@ sudo ./wg-vpn.rb status
    sudo ./wg-vpn-client.rb setup ./node1.conf
    ```
 
-   Or run `sudo ./wg-vpn-client.rb setup` and enter the path when prompted.
+   Or run `sudo ./wg-vpn-client.rb setup` and enter the path when prompted. The source file is removed after copying; only the copy in `/etc/wireguard` is kept.
 3. Say **y** when asked to enable on boot if you want the tunnel to start automatically.
 
 The interface name is derived from the config filename (e.g. `node1.conf` → interface `node1`). With one config in `/etc/wireguard`, `up`, `down`, `status`, `enable-boot`, and `disable-boot` auto-detect the interface.
@@ -160,10 +159,28 @@ The interface name is derived from the config filename (e.g. `node1.conf` → in
 
 ## Quick reference
 
+**Server (wg-vpn.rb):**
+
 ```text
-wg-vpn.rb: setup | add-client | forward PORT INTERNAL_IP [udp|tcp] | status
+sudo ./wg-vpn.rb              # Menu
+sudo ./wg-vpn.rb setup
+sudo ./wg-vpn.rb add-client
+sudo ./wg-vpn.rb forward      # Interactive
+sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
+sudo ./wg-vpn.rb status
 ```
 
-- **Server**: Debian, root, wireguard + firewalld (+ qrencode for QR).
+**Client (wg-vpn-client.rb):**
+
+```text
+sudo ./wg-vpn-client.rb setup ./node1.conf
+sudo ./wg-vpn-client.rb up
+sudo ./wg-vpn-client.rb down
+sudo ./wg-vpn-client.rb status
+sudo ./wg-vpn-client.rb enable-boot
+sudo ./wg-vpn-client.rb disable-boot
+```
+
+- **Server**: Debian, root, wireguard + firewalld + resolvconf (+ qrencode for QR).
 - **After setup**: Forward UDP 51820 (and any forwarded ports like 4570) to the server.
-- **Clients**: Use the `.conf` (or QR) from `add-client` in the WireGuard app.
+- **Clients**: Use the `.conf` (or QR) from `add-client`. Run `wg-vpn-client.rb setup` on the client; the source config is removed after copying.
