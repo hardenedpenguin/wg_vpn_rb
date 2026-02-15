@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 #
 # WireGuard VPN server manager for Debian.
-# Run with no args for menu, or: setup | add-client | forward [port] [internal_ip] [proto] | status
+# Run with no args for menu, or: setup | add-client | forward [ext_port] [internal_ip] [internal_port] [proto] | status
 #
 
 require 'fileutils'
@@ -126,9 +126,13 @@ def forward_interactive
     return
   end
 
-  print "Port to forward (e.g. 4570): "
+  print "External port (e.g. 8080): "
   ext_port = gets.strip
   return if ext_port.empty?
+
+  print "Internal port [#{ext_port}]: "
+  internal_port = gets.strip
+  internal_port = ext_port if internal_port.empty?
 
   print "Internal IP (e.g. 10.8.0.4) [#{clients.first}]: "
   internal_ip = gets.strip
@@ -138,21 +142,22 @@ def forward_interactive
   proto = gets.strip
   proto = 'udp' if proto.empty?
 
-  add_port_forward(ext_port, internal_ip, proto)
+  add_port_forward(ext_port, internal_ip, internal_port, proto)
 end
 
-def add_port_forward(ext_port, internal_ip, proto = 'udp')
+def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   root_check
+  internal_port ||= ext_port
   wan = get_wan_interface
   zone = get_fw_zone
   proto = proto.downcase
 
-  puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{ext_port} (#{proto})"
+  puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{internal_port} (#{proto})"
 
   run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port',
-      "port=#{ext_port}:proto=#{proto}:toport=#{ext_port}:toaddr=#{internal_ip}")
+      "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}")
   run('firewall-cmd', '--permanent', '--direct', '--add-rule', 'ipv4', 'filter', 'FORWARD', '0',
-      '-d', internal_ip, '-p', proto, '--dport', ext_port.to_s, '-j', 'ACCEPT')
+      '-d', internal_ip, '-p', proto, '--dport', internal_port.to_s, '-j', 'ACCEPT')
 
   run('firewall-cmd', '--reload')
   puts "Done."
@@ -224,13 +229,20 @@ when 'setup'       then setup_server
 when 'add-client'  then add_client
 when 'forward'
   if ARGV[1] && ARGV[2]
-    add_port_forward(ARGV[1], ARGV[2], ARGV[3] || 'udp')
+    ext_port, internal_ip = ARGV[1], ARGV[2]
+    if ARGV[4]
+      add_port_forward(ext_port, internal_ip, ARGV[3], ARGV[4])
+    elsif ARGV[3]
+      add_port_forward(ext_port, internal_ip, ARGV[3] =~ /^\d+$/ ? ARGV[3] : nil, ARGV[3] =~ /^\d+$/ ? 'udp' : ARGV[3])
+    else
+      add_port_forward(ext_port, internal_ip)
+    end
   else
     forward_interactive
   end
 when 'status'      then run('wg', 'show')
 when nil, 'menu'   then run_menu
 else
-  puts "Commands: setup | add-client | forward [port] [internal_ip] [proto] | status"
+  puts "Commands: setup | add-client | forward [ext_port] [internal_ip] [internal_port] [proto] | status"
   puts "Run with no args for menu."
 end

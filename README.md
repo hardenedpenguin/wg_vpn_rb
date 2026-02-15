@@ -50,7 +50,7 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 
 ### Port forward (`forward`)
 
-Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address.
+Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address. Supports port remapping (e.g. external 8080 → internal 80).
 
 1. Adds a forward-port (DNAT) to the default zone.
 2. Adds a direct FORWARD rule so physical→virtual traffic is allowed.
@@ -69,7 +69,7 @@ Run with no arguments for a menu:
 sudo ./wg-vpn.rb
 ```
 
-The menu prompts for each action. For port forwarding, it lists existing clients and asks for port, internal IP (with default), and protocol.
+The menu prompts for each action. For port forwarding, it lists existing clients and asks for external port, internal port (defaults to external), internal IP, and protocol.
 
 ### Commands (non-interactive)
 
@@ -77,7 +77,7 @@ The menu prompts for each action. For port forwarding, it lists existing clients
 |-----------|-------------|
 | `setup`   | Install packages, configure firewall, create server config, start WireGuard |
 | `add-client` | Add a client; prompts for name |
-| `forward [PORT] [INTERNAL_IP] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
+| `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
 | `status`  | Show `wg show` |
 
 ### Examples
@@ -101,10 +101,17 @@ sudo ./wg-vpn.rb add-client
 
 ```bash
 sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
-# Forward UDP 4570 to VPN client 10.8.0.4
+# Forward UDP 4570 → 10.8.0.4:4570
 ```
 
-On your router, also forward **UDP 4570** to the server so external nodes can reach the AllStar node.
+**Port forward with different internal port (e.g. 8080 → 80)**
+
+```bash
+sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp
+# Forward TCP 8080 → 10.8.0.4:80
+```
+
+On your router, forward the external port(s) to the server so clients are reachable.
 
 **Show status**
 
@@ -167,6 +174,7 @@ sudo ./wg-vpn.rb setup
 sudo ./wg-vpn.rb add-client
 sudo ./wg-vpn.rb forward      # Interactive
 sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
+sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp   # ext→int port
 sudo ./wg-vpn.rb status
 ```
 
