@@ -48,6 +48,16 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 4. Appends a `[Peer]` block to `wg0.conf`.
 5. Reloads WireGuard. If `qrencode` is installed, prints a QR code.
 
+### Remove client (`remove-client`)
+
+Removes a client and cleans up associated port forwards.
+
+1. Prompts for confirmation.
+2. Removes all port forwards targeting that client's VPN IP from firewalld.
+3. Removes the `[Peer]` block from `wg0.conf`.
+4. Deletes the client config from `/etc/wireguard/clients/`.
+5. Reloads WireGuard.
+
 ### Port forward (`forward`)
 
 Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address. Supports port remapping (e.g. external 8080 → internal 80).
@@ -77,6 +87,7 @@ The menu prompts for each action. For port forwarding, it lists existing clients
 |-----------|-------------|
 | `setup`   | Install packages, configure firewall, create server config, start WireGuard |
 | `add-client` | Add a client; prompts for name |
+| `remove-client [name]` | Remove client, port forwards, and config; prompts for confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
 | `status`  | Show `wg show` |
 
@@ -95,6 +106,13 @@ Then on your router: forward **UDP 51820** to this machine’s LAN IP.
 ```bash
 sudo ./wg-vpn.rb add-client
 # Enter client name (e.g., node1, portable2)
+```
+
+**Remove a client**
+
+```bash
+sudo ./wg-vpn.rb remove-client portable2
+# Removes peer, port forwards, and client config
 ```
 
 **Port forward for ASL3 (IAX2 on 4570)**
@@ -172,6 +190,7 @@ The interface name is derived from the config filename (e.g. `node1.conf` → in
 sudo ./wg-vpn.rb              # Menu
 sudo ./wg-vpn.rb setup
 sudo ./wg-vpn.rb add-client
+sudo ./wg-vpn.rb remove-client portable2
 sudo ./wg-vpn.rb forward      # Interactive
 sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp   # ext→int port

@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 #
 # WireGuard VPN server manager for Debian.
-# Run with no args for menu, or: setup | add-client | forward [ext_port] [internal_ip] [internal_port] [proto] | status
+# Run with no args for menu, or: setup | add-client | remove-client [name] | forward [ext_port] [internal_ip] [internal_port] [proto] | status
 #
 
 require 'fileutils'
@@ -42,6 +42,27 @@ end
 def list_client_ips
   return [] unless File.file?(WG_CONF)
   File.read(WG_CONF).scan(/AllowedIPs = (10\.8\.0\.\d+)/).flatten.uniq.sort
+end
+
+def list_client_names
+  return [] unless Dir.exist?(WG_CLIENTS)
+  Dir[File.join(WG_CLIENTS, '*.conf')].map { |f| File.basename(f, '.conf') }.sort
+end
+
+def client_ip_for_name(name)
+  return nil unless File.file?(WG_CONF)
+  content = File.read(WG_CONF)
+  in_matching_peer = false
+  content.each_line do |line|
+    if line.strip == '[Peer]'
+      in_matching_peer = false
+    elsif line =~ /# Name = #{Regexp.escape(name)}\s*$/
+      in_matching_peer = true
+    elsif in_matching_peer && line =~ /AllowedIPs = (10\.8\.0\.\d+)/
+      return $1
+    end
+  end
+  nil
 end
 
 def root_check
@@ -203,6 +224,81 @@ def add_client
   puts "Assigned IP: #{next_ip}"
 end
 
+def remove_port_forwards_for(client_ip)
+  zone = get_fw_zone
+  forwards = capture('firewall-cmd', '--permanent', "--zone=#{zone}", '--list-forward-ports')
+  removed = false
+  forwards.split("\n").each do |line|
+    line = line.strip
+    next if line.empty?
+    next unless line.include?("toaddr=#{client_ip}")
+    system('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
+    if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=/
+      system('firewall-cmd', '--permanent', '--direct', '--remove-rule', 'ipv4', 'filter', 'FORWARD', '0',
+             '-d', client_ip, '-p', $2, '--dport', $3, '-j', 'ACCEPT')
+    end
+    removed = true
+  end
+  run('firewall-cmd', '--reload') if removed
+end
+
+def remove_peer_block_from_conf(client_ip)
+  lines = File.readlines(WG_CONF)
+  out = []
+  i = 0
+  while i < lines.size
+    if lines[i].strip == '[Peer]'
+      block = [lines[i]]
+      i += 1
+      while i < lines.size && !lines[i].strip.start_with?('[')
+        block << lines[i]
+        i += 1
+      end
+      out.concat(block) unless block.any? { |l| l.include?("AllowedIPs = #{client_ip}/") }
+    else
+      out << lines[i]
+      i += 1
+    end
+  end
+  File.open(WG_CONF, 'w', 0o600) { |f| f.write(out.join) }
+end
+
+def remove_client_interactive
+  root_check
+  names = list_client_names
+  if names.empty?
+    puts "No clients."
+    return
+  end
+  puts "Clients: #{names.join(', ')}"
+  print "Client name to remove: "
+  name = gets.strip
+  return if name.empty?
+  remove_client(name)
+end
+
+def remove_client(name)
+  root_check
+  abort "Error: #{WG_CONF} not found. Run setup first." unless File.file?(WG_CONF)
+
+  client_ip = client_ip_for_name(name)
+  abort "Error: Client '#{name}' not found." unless client_ip
+
+  conf_path = File.join(WG_CLIENTS, "#{name}.conf")
+  unless File.file?(conf_path)
+    puts "Warning: Config #{conf_path} not found (may have been removed)."
+  end
+
+  print "Remove client #{name} (#{client_ip})? [y/N]: "
+  abort "Aborted." unless $stdin.gets&.strip&.downcase == 'y'
+
+  remove_port_forwards_for(client_ip)
+  remove_peer_block_from_conf(client_ip)
+  File.delete(conf_path) if File.file?(conf_path)
+  apply_wg_config
+  puts "Removed #{name}."
+end
+
 def run_menu
   loop do
     puts
@@ -210,15 +306,17 @@ def run_menu
     puts "  1) Setup server"
     puts "  2) Add client"
     puts "  3) Forward port"
-    puts "  4) Status"
-    puts "  5) Exit"
+    puts "  4) Remove client"
+    puts "  5) Status"
+    puts "  6) Exit"
     print "Choice: "
     case gets.strip
     when '1' then setup_server
     when '2' then add_client
     when '3' then forward_interactive
-    when '4' then run('wg', 'show')
-    when '5' then puts "Bye."; break
+    when '4' then remove_client_interactive
+    when '5' then run('wg', 'show')
+    when '6' then puts "Bye."; break
     else puts "Invalid choice."
     end
   end
@@ -227,6 +325,12 @@ end
 case ARGV[0]
 when 'setup'       then setup_server
 when 'add-client'  then add_client
+when 'remove-client'
+  if ARGV[1]
+    remove_client(ARGV[1])
+  else
+    remove_client_interactive
+  end
 when 'forward'
   if ARGV[1] && ARGV[2]
     ext_port, internal_ip = ARGV[1], ARGV[2]
@@ -243,6 +347,6 @@ when 'forward'
 when 'status'      then run('wg', 'show')
 when nil, 'menu'   then run_menu
 else
-  puts "Commands: setup | add-client | forward [ext_port] [internal_ip] [internal_port] [proto] | status"
+  puts "Commands: setup | add-client | remove-client [name] | forward [ext_port] [internal_ip] [internal_port] [proto] | status"
   puts "Run with no args for menu."
 end
