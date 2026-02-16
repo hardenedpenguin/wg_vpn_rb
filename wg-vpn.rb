@@ -208,6 +208,8 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
 
   run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port',
       "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}")
+  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-rich-rule',
+      "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{proto}' accept")
 
   run('firewall-cmd', '--reload')
   puts "Done."
@@ -262,6 +264,10 @@ def remove_port_forwards_for(client_ip)
     next if line.empty?
     next unless line.include?("toaddr=#{client_ip}")
     system('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
+    if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=/
+      system('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--remove-rich-rule',
+             "rule family='ipv4' destination address='#{client_ip}' port port='#{$3}' protocol='#{$2}' accept")
+    end
     removed = true
   end
   run('firewall-cmd', '--reload') if removed
