@@ -2,7 +2,8 @@
 # frozen_string_literal: true
 #
 # WireGuard VPN server manager for Debian.
-# Run with no args for menu, or: setup | add-client | remove-client [name] | forward [ext_port] [internal_ip] [internal_port] [proto] | status
+# Uses firewalld policies (no direct rules).
+# Run with no args for menu, or: setup | add-client | remove-client [name] | forward | list-forwards | status
 #
 
 require 'fileutils'
@@ -86,7 +87,8 @@ end
 def setup_server
   root_check
   wan = get_wan_interface
-  puts "Detected WAN Interface: #{wan}"
+  wan_zone = get_fw_zone
+  puts "Detected WAN: #{wan} (zone: #{wan_zone})"
 
   puts 'Installing WireGuard and Firewalld...'
   run('apt-get', 'update')
@@ -114,23 +116,27 @@ def setup_server
     File.open(WG_CONF, 'w', 0o600) { |f| f.write(conf) }
   end
 
-  puts "Configuring Firewall..."
+  puts "Configuring Firewall (policy-based)..."
   run('systemctl', 'enable', '--now', 'firewalld')
-  zone = get_fw_zone
-  puts "Using zone: #{zone}"
 
-  run('firewall-cmd', '--permanent', '--add-port', "#{WG_PORT}/udp")
-  run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-interface=wg0')
+  # 1. WireGuard zone
+  system('firewall-cmd', '--permanent', '--new-zone=wireguard') || true
+  run('firewall-cmd', '--permanent', '--zone=wireguard', '--add-interface=wg0')
+  run('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--add-port', "#{WG_PORT}/udp")
 
-  # NAT: no zone masquerade (preserves source IP for port-forwards). Targeted masquerade for VPN→internet only.
-  run('firewall-cmd', '--permanent', '--direct', '--add-rule', 'ipv4', 'nat', 'POSTROUTING', '0',
-      '-o', 'wg0', '-j', 'ACCEPT')
-  run('firewall-cmd', '--permanent', '--direct', '--add-rule', 'ipv4', 'nat', 'POSTROUTING', '0',
-      '-s', VPN_SUBNET, '-o', wan, '-j', 'MASQUERADE')
+  # 2. Outbound policy (VPN → WAN) + targeted masquerade
+  system('firewall-cmd', '--permanent', '--new-policy=wg-to-wan') || true
+  run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--add-ingress-zone=wireguard')
+  run('firewall-cmd', '--permanent', '--policy=wg-to-wan', "--add-egress-zone=#{wan_zone}")
+  run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--set-target=ACCEPT')
+  run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--add-rich-rule',
+      "rule family='ipv4' source address='#{VPN_SUBNET}' masquerade")
 
-  # FORWARD: allow wg0↔WAN (firewalld drops physical→virtual by default)
-  run('firewall-cmd', '--permanent', '--direct', '--add-rule', 'ipv4', 'filter', 'FORWARD', '0', '-i', 'wg0', '-o', wan, '-j', 'ACCEPT')
-  run('firewall-cmd', '--permanent', '--direct', '--add-rule', 'ipv4', 'filter', 'FORWARD', '0', '-i', wan, '-o', 'wg0', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
+  # 3. Inbound policy (WAN → VPN) for port forwards
+  system('firewall-cmd', '--permanent', '--new-policy=wan-to-wg') || true
+  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', "--add-ingress-zone=#{wan_zone}")
+  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-egress-zone=wireguard')
+  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--set-target=ACCEPT')
 
   run('firewall-cmd', '--reload')
   run('systemctl', 'enable', '--now', 'wg-quick@wg0')
@@ -166,6 +172,31 @@ def forward_interactive
   add_port_forward(ext_port, internal_ip, internal_port, proto)
 end
 
+def list_forwards
+  root_check
+  zone = get_fw_zone
+  forwards = capture('firewall-cmd', '--permanent', "--zone=#{zone}", '--list-forward-ports')
+  lines = forwards.split("\n").map(&:strip).reject(&:empty?)
+  if lines.empty?
+    puts "No port forwards configured."
+    return
+  end
+  ip_to_name = {}
+  ip_to_name = File.file?(WG_CONF) ? File.read(WG_CONF).scan(/# Name = ([^\n]+)\s*\n.*?AllowedIPs = (10\.8\.0\.\d+)/m).to_h { |name, ip| [ip, name.strip] } : {}
+  puts "Port forwards (#{zone}):"
+  puts "  Ext Port  Proto  ->  Internal           Client"
+  puts "  " + "-" * 50
+  lines.each do |line|
+    if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=(10\.8\.0\.\d+)/
+      ext, proto, int, ip = $1, $2, $3, $4
+      name = ip_to_name[ip] || "-"
+      puts "  %-8s  %-4s   ->  %s:%-5s  %s" % [ext, proto, ip, int, name]
+    else
+      puts "  #{line}"
+    end
+  end
+end
+
 def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   root_check
   internal_port ||= ext_port
@@ -177,8 +208,6 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
 
   run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port',
       "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}")
-  run('firewall-cmd', '--permanent', '--direct', '--add-rule', 'ipv4', 'filter', 'FORWARD', '0',
-      '-d', internal_ip, '-p', proto, '--dport', internal_port.to_s, '-j', 'ACCEPT')
 
   run('firewall-cmd', '--reload')
   puts "Done."
@@ -233,10 +262,6 @@ def remove_port_forwards_for(client_ip)
     next if line.empty?
     next unless line.include?("toaddr=#{client_ip}")
     system('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
-    if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=/
-      system('firewall-cmd', '--permanent', '--direct', '--remove-rule', 'ipv4', 'filter', 'FORWARD', '0',
-             '-d', client_ip, '-p', $2, '--dport', $3, '-j', 'ACCEPT')
-    end
     removed = true
   end
   run('firewall-cmd', '--reload') if removed
@@ -307,16 +332,18 @@ def run_menu
     puts "  2) Add client"
     puts "  3) Forward port"
     puts "  4) Remove client"
-    puts "  5) Status"
-    puts "  6) Exit"
+    puts "  5) List forwards"
+    puts "  6) Status"
+    puts "  7) Exit"
     print "Choice: "
     case gets.strip
     when '1' then setup_server
     when '2' then add_client
     when '3' then forward_interactive
     when '4' then remove_client_interactive
-    when '5' then run('wg', 'show')
-    when '6' then puts "Bye."; break
+    when '5' then list_forwards
+    when '6' then run('wg', 'show')
+    when '7' then puts "Bye."; break
     else puts "Invalid choice."
     end
   end
@@ -344,9 +371,10 @@ when 'forward'
   else
     forward_interactive
   end
-when 'status'      then run('wg', 'show')
-when nil, 'menu'   then run_menu
+when 'list-forwards' then list_forwards
+when 'status'       then run('wg', 'show')
+when nil, 'menu'    then run_menu
 else
-  puts "Commands: setup | add-client | remove-client [name] | forward [ext_port] [internal_ip] [internal_port] [proto] | status"
+  puts "Commands: setup | add-client | remove-client [name] | forward [...] | list-forwards | status"
   puts "Run with no args for menu."
 end

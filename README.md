@@ -29,13 +29,11 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 2. Enables IPv4 forwarding (`net.ipv4.ip_forward=1`) in `/etc/sysctl.d/99-wireguard.conf`.
 3. Creates `/etc/wireguard` and `/etc/wireguard/clients`, generates server key pair if missing.
 4. Writes initial `wg0.conf` with `MTU = 1420` if it does not exist.
-5. Configures firewalld:
-   - Uses the **default zone** (e.g. `public` or `allstarlink`).
-   - Opens UDP **51820**.
-   - Adds `wg0` to the zone.
-   - **No zone masquerade** — port-forwards preserve source IP for ASL3.
-   - Targeted masquerade: only VPN→internet traffic is SNAT'd.
-   - FORWARD rules for wg0 ↔ WAN (physical→virtual forwarding allowed).
+5. Configures firewalld (policy-based, no direct rules):
+   - Creates **wireguard** zone for `wg0`; WAN stays in default zone (e.g. `public` or `allstarlink`).
+   - Opens UDP **51820** on WAN zone.
+   - **wg-to-wan** policy: VPN→internet with targeted masquerade (source 10.8.0.0/24 only).
+   - **wan-to-wg** policy: WAN→VPN for port forwards (no masquerade; preserves source IP for ASL3).
 6. Enables and starts `wg-quick@wg0`.
 
 You must **forward UDP 51820** from your router to this host for clients to connect.
@@ -62,8 +60,7 @@ Removes a client and cleans up associated port forwards.
 
 Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address. Supports port remapping (e.g. external 8080 → internal 80).
 
-1. Adds a forward-port (DNAT) to the default zone.
-2. Adds a direct FORWARD rule so physical→virtual traffic is allowed.
+1. Adds a forward-port (DNAT) to the WAN zone. The wan-to-wg policy allows the forwarded traffic.
 
 ---
 
@@ -89,6 +86,7 @@ The menu prompts for each action. For port forwarding, it lists existing clients
 | `add-client` | Add a client; prompts for name |
 | `remove-client [name]` | Remove client, port forwards, and config; prompts for confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
+| `list-forwards` | List active port forwards (ext port, proto, internal IP, client name) |
 | `status`  | Show `wg show` |
 
 ### Examples
@@ -130,6 +128,12 @@ sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp
 ```
 
 On your router, forward the external port(s) to the server so clients are reachable.
+
+**List port forwards**
+
+```bash
+sudo ./wg-vpn.rb list-forwards
+```
 
 **Show status**
 
@@ -194,6 +198,7 @@ sudo ./wg-vpn.rb remove-client portable2
 sudo ./wg-vpn.rb forward      # Interactive
 sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp   # ext→int port
+sudo ./wg-vpn.rb list-forwards
 sudo ./wg-vpn.rb status
 ```
 
