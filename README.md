@@ -41,10 +41,11 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 ### Add client (`add-client`)
 
 1. Prompts for client name.
-2. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
-3. Writes the client config: Address, DNS (`1.1.1.1`), MTU (1420), Peer with Endpoint (server public IP via `curl ifconfig.me`), AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
-4. Appends a `[Peer]` block to `wg0.conf`.
-5. Reloads WireGuard. If `qrencode` is installed, prints a QR code.
+2. Prompts for server endpoint: Enter = auto-detect public IP via `curl ifconfig.me`, or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP.
+3. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
+4. Writes the client config: Address, DNS (`1.1.1.1`), MTU (1420), Peer with Endpoint, AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
+5. Appends a `[Peer]` block to `wg0.conf`.
+6. Reloads WireGuard. If `qrencode` is installed, prints a QR code.
 
 ### Remove client (`remove-client`)
 
@@ -60,7 +61,7 @@ Removes a client and cleans up associated port forwards.
 
 Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address. Supports port remapping (e.g. external 8080 → internal 80).
 
-1. Adds a forward-port (DNAT) to the WAN zone. The wan-to-wg policy allows the forwarded traffic.
+1. Adds a forward-port (DNAT) to the WAN zone and a per-port rich rule on the wan-to-wg policy (required so physical→virtual forwarding is allowed). Re-running the same forward is idempotent.
 
 ---
 
@@ -147,9 +148,10 @@ sudo ./wg-vpn.rb status
 
 - Config file: `/etc/wireguard/clients/<name>.conf`
 - Copy it to the client and import into the WireGuard app.
+- On add, you can enter a **domain name** (e.g. `vpn.example.com`) as the server endpoint so clients keep working when the server's public IP changes (dynamic IP / DHCP).
 - On add, if `qrencode` is installed, a QR code is printed; mobile apps can scan it.
 - Client DNS is `1.1.1.1`; edit the file to change it.
-- AllowedIPs is `10.8.0.0/24` (VPN subnet).
+- AllowedIPs is `10.8.0.0/24` (VPN subnet). Removed client configs are backed up under `/etc/wireguard/clients/removed/`.
 
 ---
 

@@ -119,21 +119,20 @@ def setup_server
   puts "Configuring Firewall (policy-based)..."
   run('systemctl', 'enable', '--now', 'firewalld')
 
-  # 1. WireGuard zone
-  system('firewall-cmd', '--permanent', '--new-zone=wireguard') || true
+  zones = capture('firewall-cmd', '--permanent', '--get-zones').split(/[\s]+/)
+  run('firewall-cmd', '--permanent', '--new-zone=wireguard') unless zones.include?('wireguard')
   run('firewall-cmd', '--permanent', '--zone=wireguard', '--add-interface=wg0')
   run('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--add-port', "#{WG_PORT}/udp")
 
-  # 2. Outbound policy (VPN → WAN) + targeted masquerade
-  system('firewall-cmd', '--permanent', '--new-policy=wg-to-wan') || true
+  policies = capture('firewall-cmd', '--permanent', '--get-policies').split(/[\s]+/)
+  run('firewall-cmd', '--permanent', '--new-policy=wg-to-wan') unless policies.include?('wg-to-wan')
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--add-ingress-zone=wireguard')
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', "--add-egress-zone=#{wan_zone}")
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--set-target=ACCEPT')
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--add-rich-rule',
       "rule family='ipv4' source address='#{VPN_SUBNET}' masquerade")
 
-  # 3. Inbound policy (WAN → VPN) for port forwards
-  system('firewall-cmd', '--permanent', '--new-policy=wan-to-wg') || true
+  run('firewall-cmd', '--permanent', '--new-policy=wan-to-wg') unless policies.include?('wan-to-wg')
   run('firewall-cmd', '--permanent', '--policy=wan-to-wg', "--add-ingress-zone=#{wan_zone}")
   run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-egress-zone=wireguard')
   run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--set-target=ACCEPT')
@@ -204,10 +203,15 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   zone = get_fw_zone
   proto = proto.downcase
 
+  forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
+  if system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
+    puts "Forward already configured."
+    return
+  end
+
   puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{internal_port} (#{proto})"
 
-  run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port',
-      "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}")
+  run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port', forward_spec)
   run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-rich-rule',
       "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{proto}' accept")
 
@@ -217,6 +221,8 @@ end
 
 def add_client
   root_check
+  abort "Error: #{WG_CONF} not found. Run setup first." unless File.file?(WG_CONF)
+
   print "Client Name (e.g., node1): "
   name = gets.strip.gsub(/\s+/, '-')
 
@@ -226,7 +232,16 @@ def add_client
   client_priv = capture('wg', 'genkey')
   client_pub = capture('wg', 'pubkey', stdin_data: client_priv)
   server_pub = File.read(SERVER_PUB).strip
-  endpoint = "#{capture('curl', '-s', 'ifconfig.me')}:#{WG_PORT}"
+
+  print "Server endpoint - domain name or IP (Enter = auto-detect IP): "
+  endpoint_input = gets.strip
+  endpoint = if endpoint_input.empty?
+    "#{capture('curl', '-s', 'ifconfig.me')}:#{WG_PORT}"
+  elsif endpoint_input.include?(':')
+    endpoint_input
+  else
+    "#{endpoint_input}:#{WG_PORT}"
+  end
 
   client_conf = <<~CONF
     [Interface]
@@ -325,7 +340,14 @@ def remove_client(name)
 
   remove_port_forwards_for(client_ip)
   remove_peer_block_from_conf(client_ip)
-  File.delete(conf_path) if File.file?(conf_path)
+  if File.file?(conf_path)
+    backup_dir = File.join(WG_CLIENTS, 'removed')
+    FileUtils.mkdir_p(backup_dir, mode: 0o700)
+    backup_path = File.join(backup_dir, "#{name}.conf.#{Time.now.strftime('%Y%m%d%H%M%S')}")
+    FileUtils.cp(conf_path, backup_path, preserve: true)
+    File.delete(conf_path)
+    puts "Config backed up to #{backup_path}"
+  end
   apply_wg_config
   puts "Removed #{name}."
 end
