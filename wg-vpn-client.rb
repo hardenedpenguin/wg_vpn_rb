@@ -64,7 +64,9 @@ def setup(config_path = nil)
   FileUtils.mkdir_p(WG_DIR)
   FileUtils.chmod(0o700, WG_DIR)
 
-  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_]/, '')
+  # Keep dots and hyphens (e.g. my.node -> my.node); strip path sep and other unsafe chars
+  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_.-]/, '')
+  base_name = 'wg0' if base_name.empty?
   dest = File.join(WG_DIR, "#{base_name}.conf")
 
   run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)

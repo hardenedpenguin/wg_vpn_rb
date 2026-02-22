@@ -42,10 +42,11 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 
 1. Prompts for client name.
 2. Prompts for server endpoint: Enter = auto-detect public IP via `curl ifconfig.me`, or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP.
-3. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
-4. Writes the client config: Address, DNS (`1.1.1.1`), MTU (1420), Peer with Endpoint, AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
-5. Appends a `[Peer]` block to `wg0.conf`.
-6. Reloads WireGuard. If `qrencode` is installed, prints a QR code.
+3. Prompts for client DNS (Enter = default `1.1.1.1`).
+4. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
+5. Writes the client config: Address, DNS (as chosen), MTU (1420), Peer with Endpoint, AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
+6. Appends a `[Peer]` block to `wg0.conf`.
+7. Reloads WireGuard. If `qrencode` is installed, prints a QR code.
 
 ### Remove client (`remove-client`)
 
@@ -84,10 +85,11 @@ The menu prompts for each action. For port forwarding, it lists existing clients
 | Command   | Description |
 |-----------|-------------|
 | `setup`   | Install packages, configure firewall, create server config, start WireGuard |
-| `add-client` | Add a client; prompts for name |
+| `add-client` | Add a client; prompts for name, endpoint, DNS |
 | `remove-client [name]` | Remove client, port forwards, and config; prompts for confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
 | `list-forwards` | List active port forwards (ext port, proto, internal IP, client name) |
+| `list-clients` | List clients (name and VPN IP) |
 | `status`  | Show `wg show` |
 
 ### Examples
@@ -136,6 +138,12 @@ On your router, forward the external port(s) to the server so clients are reacha
 sudo ./wg-vpn.rb list-forwards
 ```
 
+**List clients**
+
+```bash
+sudo ./wg-vpn.rb list-clients
+```
+
 **Show status**
 
 ```bash
@@ -150,7 +158,7 @@ sudo ./wg-vpn.rb status
 - Copy it to the client and import into the WireGuard app.
 - On add, you can enter a **domain name** (e.g. `vpn.example.com`) as the server endpoint so clients keep working when the server's public IP changes (dynamic IP / DHCP).
 - On add, if `qrencode` is installed, a QR code is printed; mobile apps can scan it.
-- Client DNS is `1.1.1.1`; edit the file to change it.
+- Client DNS defaults to `1.1.1.1`; you can override it when adding a client (prompt), or edit the config file afterward.
 - AllowedIPs is `10.8.0.0/24` (VPN subnet). Removed client configs are backed up under `/etc/wireguard/clients/removed/`.
 
 ---
@@ -184,7 +192,7 @@ sudo ./wg-vpn.rb status
    Or run `sudo ./wg-vpn-client.rb setup` and enter the path when prompted. The source file is removed after copying; only the copy in `/etc/wireguard` is kept.
 3. Say **y** when asked to enable on boot if you want the tunnel to start automatically.
 
-The interface name is derived from the config filename (e.g. `node1.conf` → interface `node1`). With one config in `/etc/wireguard`, `up`, `down`, `status`, `enable-boot`, and `disable-boot` auto-detect the interface.
+The interface name is derived from the config filename: only the `.conf` extension is stripped, and letters, digits, underscores, dots, and hyphens are kept (e.g. `node1.conf` → `node1`, `my.node.conf` → `my.node`). With one config in `/etc/wireguard`, `up`, `down`, `status`, `enable-boot`, and `disable-boot` auto-detect the interface.
 
 ---
 
@@ -201,6 +209,7 @@ sudo ./wg-vpn.rb forward      # Interactive
 sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp   # ext→int port
 sudo ./wg-vpn.rb list-forwards
+sudo ./wg-vpn.rb list-clients
 sudo ./wg-vpn.rb status
 ```
 

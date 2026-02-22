@@ -3,7 +3,7 @@
 #
 # WireGuard VPN server manager for Debian.
 # Uses firewalld policies (no direct rules).
-# Run with no args for menu, or: setup | add-client | remove-client [name] | forward | list-forwards | status
+# Run with no args for menu, or: setup | add-client | remove-client [name] | forward | list-forwards | list-clients | status
 #
 
 require 'fileutils'
@@ -30,8 +30,8 @@ def run(*cmd)
   system(*cmd) || (raise "Command failed: #{cmd.join(' ')}")
 end
 
-def capture(*cmd)
-  out, err, status = Open3.capture3(*cmd)
+def capture(*cmd, **opts)
+  out, err, status = Open3.capture3(*cmd, **opts)
   raise "Command failed: #{cmd.join(' ')}: #{err}" unless status.success?
   out.strip
 end
@@ -196,6 +196,22 @@ def list_forwards
   end
 end
 
+def list_clients
+  root_check
+  names = list_client_names
+  if names.empty?
+    puts "No clients."
+    return
+  end
+  puts "Clients:"
+  puts "  %-20s  %s" % ["Name", "VPN IP"]
+  puts "  " + "-" * 40
+  names.each do |name|
+    ip = client_ip_for_name(name) || "-"
+    puts "  %-20s  %s" % [name, ip]
+  end
+end
+
 def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   root_check
   internal_port ||= ext_port
@@ -225,9 +241,13 @@ def add_client
 
   print "Client Name (e.g., node1): "
   name = gets.strip.gsub(/\s+/, '-')
+  abort "Error: Client name cannot be empty." if name.empty?
+  abort "Error: Client name cannot contain '/' or '..'." if name.include?('/') || name.include?('..')
 
   used_ips = File.read(WG_CONF).scan(/10\.8\.0\.(\d+)/).flatten.map(&:to_i)
-  next_ip = "10.8.0.#{(2..254).find { |i| !used_ips.include?(i) }}"
+  next_host = (2..254).find { |i| !used_ips.include?(i) }
+  abort "Error: No free client IP in #{VPN_SUBNET}. Subnet exhausted." unless next_host
+  next_ip = "10.8.0.#{next_host}"
 
   client_priv = capture('wg', 'genkey')
   client_pub = capture('wg', 'pubkey', stdin_data: client_priv)
@@ -243,11 +263,15 @@ def add_client
     "#{endpoint_input}:#{WG_PORT}"
   end
 
+  print "Client DNS [#{CLIENT_DNS}]: "
+  dns_input = gets.strip
+  client_dns = dns_input.empty? ? CLIENT_DNS : dns_input
+
   client_conf = <<~CONF
     [Interface]
     PrivateKey = #{client_priv}
     Address = #{next_ip}/24
-    DNS = #{CLIENT_DNS}
+    DNS = #{client_dns}
     MTU = #{DEFAULT_MTU}
 
     [Peer]
@@ -278,10 +302,10 @@ def remove_port_forwards_for(client_ip)
     line = line.strip
     next if line.empty?
     next unless line.include?("toaddr=#{client_ip}")
-    system('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
+    run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
     if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=/
-      system('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--remove-rich-rule',
-             "rule family='ipv4' destination address='#{client_ip}' port port='#{$3}' protocol='#{$2}' accept")
+      run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--remove-rich-rule',
+          "rule family='ipv4' destination address='#{client_ip}' port port='#{$3}' protocol='#{$2}' accept")
     end
     removed = true
   end
@@ -361,8 +385,9 @@ def run_menu
     puts "  3) Forward port"
     puts "  4) Remove client"
     puts "  5) List forwards"
-    puts "  6) Status"
-    puts "  7) Exit"
+    puts "  6) List clients"
+    puts "  7) Status"
+    puts "  8) Exit"
     print "Choice: "
     case gets.strip
     when '1' then setup_server
@@ -370,8 +395,9 @@ def run_menu
     when '3' then forward_interactive
     when '4' then remove_client_interactive
     when '5' then list_forwards
-    when '6' then run('wg', 'show')
-    when '7' then puts "Bye."; break
+    when '6' then list_clients
+    when '7' then run('wg', 'show')
+    when '8' then puts "Bye."; break
     else puts "Invalid choice."
     end
   end
@@ -400,9 +426,10 @@ when 'forward'
     forward_interactive
   end
 when 'list-forwards' then list_forwards
-when 'status'       then run('wg', 'show')
-when nil, 'menu'    then run_menu
+when 'list-clients'  then list_clients
+when 'status'        then run('wg', 'show')
+when nil, 'menu'     then run_menu
 else
-  puts "Commands: setup | add-client | remove-client [name] | forward [...] | list-forwards | status"
+  puts "Commands: setup | add-client | remove-client [name] | forward [...] | list-forwards | list-clients | status"
   puts "Run with no args for menu."
 end
