@@ -1,5 +1,7 @@
 # wg-vpn.rb
 
+![GitHub total downloads](https://img.shields.io/github/downloads/hardenedpenguin/wg_vpn_rb/total?style=flat-square)
+
 A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard server on Debian and manage clients. **wg-vpn-client.rb** is a companion client-side script for Debian: it installs WireGuard, copies your config, and brings up the tunnel.
 
 ---
