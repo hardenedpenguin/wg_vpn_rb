@@ -9,6 +9,7 @@
 require 'fileutils'
 require 'open3'
 require 'tempfile'
+require 'timeout'
 
 # Configuration
 WG_DIR = '/etc/wireguard'
@@ -36,8 +37,43 @@ def capture(*cmd, **opts)
   out.strip
 end
 
+def debian_check
+  abort 'Error: This script is for Debian-based systems only.' unless File.file?('/etc/debian_version')
+end
+
 def get_wan_interface
-  capture("ip route show default | awk '/default/ {print $5}'").split("\n").first
+  out = capture("ip route show default | awk '/default/ {print $5}'")
+  out.split("\n").first.to_s.strip
+end
+
+def validate_port(port_str, label = 'Port')
+  return false unless port_str.to_s.match?(/^\d+$/)
+  p = port_str.to_i
+  return false if p < 1 || p > 65_535
+  true
+end
+
+def validate_proto(proto)
+  %w[tcp udp].include?(proto.to_s.downcase)
+end
+
+def validate_client_name(name)
+  return false if name.nil? || name.empty? || name.length > 64
+  name.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/)
+end
+
+def fetch_public_ip(timeout_sec: 10)
+  urls = ['https://ifconfig.me/ip', 'https://icanhazip.com']
+  urls.each do |url|
+    out, err, status = Timeout.timeout(timeout_sec) do
+      Open3.capture3('curl', '-s', '-f', '--max-time', '8', url)
+    end
+    ip = out.to_s.strip
+    return ip if status.success? && ip.match?(/\A[\d.]+\z/)
+  rescue Timeout::Error, Errno::ENOENT
+    next
+  end
+  abort 'Error: Could not detect public IP (curl failed or no response). Enter endpoint manually.'
 end
 
 def list_client_ips
@@ -48,6 +84,11 @@ end
 def list_client_names
   return [] unless Dir.exist?(WG_CLIENTS)
   Dir[File.join(WG_CLIENTS, '*.conf')].map { |f| File.basename(f, '.conf') }.sort
+end
+
+def peer_names_from_conf
+  return [] unless File.file?(WG_CONF)
+  File.read(WG_CONF).scan(/# Name = ([^\n]+)\s*$/).flatten.map(&:strip).uniq.sort
 end
 
 def client_ip_for_name(name)
@@ -86,7 +127,9 @@ end
 
 def setup_server
   root_check
+  debian_check
   wan = get_wan_interface
+  abort 'Error: No default route found. Configure networking first.' if wan.nil? || wan.empty?
   wan_zone = get_fw_zone
   puts "Detected WAN: #{wan} (zone: #{wan_zone})"
 
@@ -168,6 +211,18 @@ def forward_interactive
   proto = gets.strip
   proto = 'udp' if proto.empty?
 
+  unless validate_port(ext_port, 'External port')
+    puts "Error: Invalid external port (must be 1-65535)."
+    return
+  end
+  unless validate_port(internal_port, 'Internal port')
+    puts "Error: Invalid internal port (must be 1-65535)."
+    return
+  end
+  unless validate_proto(proto)
+    puts "Error: Protocol must be tcp or udp."
+    return
+  end
   add_port_forward(ext_port, internal_ip, internal_port, proto)
 end
 
@@ -198,38 +253,60 @@ end
 
 def list_clients
   root_check
-  names = list_client_names
-  if names.empty?
-    puts "No clients."
-    return
+  names_with_file = list_client_names
+  all_peer_names = peer_names_from_conf
+  orphan_names = all_peer_names - names_with_file
+
+  if names_with_file.any?
+    puts "Clients:"
+    puts "  %-20s  %s" % ["Name", "VPN IP"]
+    puts "  " + "-" * 40
+    names_with_file.each do |name|
+      ip = client_ip_for_name(name) || "-"
+      puts "  %-20s  %s" % [name, ip]
+    end
+    puts
   end
-  puts "Clients:"
-  puts "  %-20s  %s" % ["Name", "VPN IP"]
-  puts "  " + "-" * 40
-  names.each do |name|
-    ip = client_ip_for_name(name) || "-"
-    puts "  %-20s  %s" % [name, ip]
+
+  if orphan_names.any?
+    puts "Orphan peers (in wg0.conf only, no config file):"
+    puts "  %-20s  %s" % ["Name", "VPN IP"]
+    puts "  " + "-" * 40
+    orphan_names.each do |name|
+      ip = client_ip_for_name(name) || "-"
+      puts "  %-20s  %s" % [name, ip]
+    end
+    puts "  (Remove with: remove-client <name>)"
+    puts
   end
+
+  puts "No clients." if names_with_file.empty? && orphan_names.empty?
 end
 
 def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   root_check
   internal_port ||= ext_port
+  proto = proto.to_s.downcase
+  abort "Error: Invalid external port (must be 1-65535)." unless validate_port(ext_port, 'External port')
+  abort "Error: Invalid internal port (must be 1-65535)." unless validate_port(internal_port, 'Internal port')
+  abort "Error: Protocol must be tcp or udp." unless validate_proto(proto)
+
   wan = get_wan_interface
   zone = get_fw_zone
-  proto = proto.downcase
-
   forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
   if system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
     puts "Forward already configured."
     return
   end
 
+  rich_rule = "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{proto}' accept"
+  existing_rules = capture('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--list-rich-rules')
+  add_rich_rule = !existing_rules.include?(rich_rule)
+
   puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{internal_port} (#{proto})"
 
   run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port', forward_spec)
-  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-rich-rule',
-      "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{proto}' accept")
+  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-rich-rule', rich_rule) if add_rich_rule
 
   run('firewall-cmd', '--reload')
   puts "Done."
@@ -242,7 +319,9 @@ def add_client
   print "Client Name (e.g., node1): "
   name = gets.strip.gsub(/\s+/, '-')
   abort "Error: Client name cannot be empty." if name.empty?
-  abort "Error: Client name cannot contain '/' or '..'." if name.include?('/') || name.include?('..')
+  abort "Error: Client name must start with a letter or digit and contain only letters, digits, underscores, dots, and hyphens (max 64 chars)." unless validate_client_name(name)
+  conf_path = File.join(WG_CLIENTS, "#{name}.conf")
+  abort "Error: Client '#{name}' already exists. Choose another name or remove-client first." if File.file?(conf_path) || client_ip_for_name(name)
 
   used_ips = File.read(WG_CONF).scan(/10\.8\.0\.(\d+)/).flatten.map(&:to_i)
   next_host = (2..254).find { |i| !used_ips.include?(i) }
@@ -256,7 +335,7 @@ def add_client
   print "Server endpoint - domain name or IP (Enter = auto-detect IP): "
   endpoint_input = gets.strip
   endpoint = if endpoint_input.empty?
-    "#{capture('curl', '-s', 'ifconfig.me')}:#{WG_PORT}"
+    "#{fetch_public_ip}:#{WG_PORT}"
   elsif endpoint_input.include?(':')
     endpoint_input
   else
@@ -281,7 +360,6 @@ def add_client
     PersistentKeepalive = 25
   CONF
 
-  conf_path = File.join(WG_CLIENTS, "#{name}.conf")
   File.open(conf_path, 'w', 0o600) { |f| f.write(client_conf) }
 
   peer_entry = "\n[Peer]\n# Name = #{name}\nPublicKey = #{client_pub}\nAllowedIPs = #{next_ip}/32\n"
@@ -335,7 +413,7 @@ end
 
 def remove_client_interactive
   root_check
-  names = list_client_names
+  names = (list_client_names + peer_names_from_conf).uniq.sort
   if names.empty?
     puts "No clients."
     return

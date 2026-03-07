@@ -1,7 +1,5 @@
 # wg-vpn.rb
 
-![GitHub total downloads](https://img.shields.io/github/downloads/hardenedpenguin/wg_vpn_rb/total?style=flat-square)
-
 A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard server on Debian and manage clients. **wg-vpn-client.rb** is a companion client-side script for Debian: it installs WireGuard, copies your config, and brings up the tunnel.
 
 ---
@@ -27,6 +25,8 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 
 ### Setup (`setup`)
 
+Requires **Debian** (or derivative) and a **default route**. Exits with an error if not.
+
 1. Installs **wireguard**, **firewalld**, **resolvconf**, **qrencode** via `apt`.
 2. Enables IPv4 forwarding (`net.ipv4.ip_forward=1`) in `/etc/sysctl.d/99-wireguard.conf`.
 3. Creates `/etc/wireguard` and `/etc/wireguard/clients`, generates server key pair if missing.
@@ -43,7 +43,7 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 ### Add client (`add-client`)
 
 1. Prompts for client name.
-2. Prompts for server endpoint: Enter = auto-detect public IP via `curl ifconfig.me`, or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP.
+2. Prompts for server endpoint: Enter = auto-detect public IP (tries ifconfig.me/ip and icanhazip.com with timeout), or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP. Duplicate client names are rejected.
 3. Prompts for client DNS (Enter = default `1.1.1.1`).
 4. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
 5. Writes the client config: Address, DNS (as chosen), MTU (1420), Peer with Endpoint, AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
@@ -64,7 +64,7 @@ Removes a client and cleans up associated port forwards.
 
 Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address. Supports port remapping (e.g. external 8080 → internal 80).
 
-1. Adds a forward-port (DNAT) to the WAN zone and a per-port rich rule on the wan-to-wg policy (required so physical→virtual forwarding is allowed). Re-running the same forward is idempotent.
+1. Adds a forward-port (DNAT) to the WAN zone and a per-port rich rule on the wan-to-wg policy (required so physical→virtual forwarding is allowed). Ports (1–65535) and protocol (tcp/udp) are validated. Re-running the same forward is idempotent; rich rules are not duplicated.
 
 ---
 
@@ -91,7 +91,7 @@ The menu prompts for each action. For port forwarding, it lists existing clients
 | `remove-client [name]` | Remove client, port forwards, and config; prompts for confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
 | `list-forwards` | List active port forwards (ext port, proto, internal IP, client name) |
-| `list-clients` | List clients (name and VPN IP) |
+| `list-clients` | List clients (name and VPN IP); also shows orphan peers (in wg0 only, no config file) |
 | `status`  | Show `wg show` |
 
 ### Examples
@@ -175,10 +175,11 @@ sudo ./wg-vpn.rb status
 
 | Command           | Description |
 |-------------------|-------------|
-| `setup [path]`    | Install WireGuard, copy config to `/etc/wireguard` (source removed), bring up tunnel, optionally enable on boot |
+| `setup [path]`    | Install WireGuard, copy config to `/etc/wireguard` (source removed), bring up tunnel, optionally enable on boot; if path is already in `/etc/wireguard`, skips copy and just brings up |
 | `up [interface]`  | Bring up tunnel (auto-detect interface if single config) |
 | `down [interface]`| Bring down tunnel |
 | `status [interface]` | Show `wg show` |
+| `list`            | List configs and which interface is up |
 | `enable-boot [interface]` | Enable tunnel on boot |
 | `disable-boot [interface]` | Disable tunnel on boot |
 
@@ -222,6 +223,7 @@ sudo ./wg-vpn-client.rb setup ./node1.conf
 sudo ./wg-vpn-client.rb up
 sudo ./wg-vpn-client.rb down
 sudo ./wg-vpn-client.rb status
+sudo ./wg-vpn-client.rb list
 sudo ./wg-vpn-client.rb enable-boot
 sudo ./wg-vpn-client.rb disable-boot
 ```

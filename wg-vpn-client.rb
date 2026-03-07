@@ -2,10 +2,11 @@
 # frozen_string_literal: true
 #
 # WireGuard VPN client setup for Debian.
-# Commands: setup [path] | up | down | status | enable-boot | disable-boot
+# Commands: setup [path] | up | down | status | list | enable-boot | disable-boot
 #
 
 require 'fileutils'
+require 'open3'
 
 WG_DIR = '/etc/wireguard'
 
@@ -40,7 +41,8 @@ def default_interface
   return 'wg0' if confs.empty?
   return confs.first if confs.size == 1
 
-  active = `wg show interfaces 2>/dev/null`.split
+  out, = Open3.capture2('wg', 'show', 'interfaces')
+  active = (out || '').split
   (confs & active).first || confs.first
 end
 
@@ -68,10 +70,15 @@ def setup(config_path = nil)
   base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_.-]/, '')
   base_name = 'wg0' if base_name.empty?
   dest = File.join(WG_DIR, "#{base_name}.conf")
+  already_in_place = File.expand_path(config_path) == File.expand_path(dest)
 
-  run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)
-  File.delete(config_path) if File.expand_path(config_path) != File.expand_path(dest)
-  info "Config secured at #{dest}"
+  unless already_in_place
+    run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)
+    File.delete(config_path) if File.exist?(config_path)
+    info "Config secured at #{dest}"
+  else
+    info "Config already at #{dest}, bringing up tunnel."
+  end
 
   run('wg-quick', 'up', base_name)
 
@@ -110,6 +117,23 @@ def disable_boot(interface = nil)
   run('systemctl', 'disable', "wg-quick@#{interface || default_interface}")
 end
 
+def list_interfaces
+  root_check
+  confs = Dir[File.join(WG_DIR, '*.conf')].map { |p| File.basename(p, '.conf') }.sort
+  if confs.empty?
+    info "No configs in #{WG_DIR}."
+    return
+  end
+  out, = Open3.capture2('wg', 'show', 'interfaces')
+  active = (out || '').split
+  puts "  %-20s  %s" % ["Interface", "Status"]
+  puts "  " + "-" * 30
+  confs.each do |iface|
+    status = active.include?(iface) ? "up" : "down"
+    puts "  %-20s  %s" % [iface, status]
+  end
+end
+
 command = ARGV.shift
 target = ARGV.shift
 
@@ -118,6 +142,7 @@ when 'setup'       then setup(target)
 when 'up'          then up(target)
 when 'down'        then down(target)
 when 'status'      then show_status(target)
+when 'list'        then list_interfaces
 when 'enable-boot' then enable_boot(target)
 when 'disable-boot' then disable_boot(target)
 else
@@ -130,6 +155,7 @@ else
       up [iface]       Bring up tunnel (auto-detect iface if single config)
       down [iface]     Bring down tunnel
       status [iface]   Show wg status
+      list             List configs and which interface is up
       enable-boot      Enable tunnel on boot
       disable-boot     Disable tunnel on boot
   USAGE
