@@ -43,7 +43,7 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 ### Add client (`add-client`)
 
 1. Prompts for client name.
-2. Prompts for server endpoint: Enter = auto-detect public IP (tries ifconfig.me/ip and icanhazip.com with timeout), or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP. Duplicate client names are rejected.
+2. Prompts for server endpoint: Enter = auto-detect public IP via **curl** (HTTPS only; tries ifconfig.me/ip and icanhazip.com with timeout), or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP. **curl** must be installed for auto-detect; otherwise enter the endpoint manually. Duplicate client names are rejected.
 3. Prompts for client DNS (Enter = default `1.1.1.1`).
 4. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
 5. Writes the client config: Address, DNS (as chosen), MTU (1420), Peer with Endpoint, AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
@@ -64,7 +64,7 @@ Removes a client and cleans up associated port forwards.
 
 Forwards a port on the server’s WAN interface to a VPN client. **Preserves source IP** so services like AllStar Link (ASL3) see the real peer address. Supports port remapping (e.g. external 8080 → internal 80).
 
-1. Adds a forward-port (DNAT) to the WAN zone and a per-port rich rule on the wan-to-wg policy (required so physical→virtual forwarding is allowed). Ports (1–65535) and protocol (tcp/udp) are validated. Re-running the same forward is idempotent; rich rules are not duplicated.
+1. Adds a forward-port (DNAT) to the WAN zone and a per-port rich rule on the wan-to-wg policy (required so physical→virtual forwarding is allowed). Ports (1–65535), protocol (tcp/udp), and internal IP (must be a VPN client address `10.8.0.2`–`10.8.0.254`) are validated. Re-running the same forward is idempotent; rich rules are not duplicated.
 
 ---
 

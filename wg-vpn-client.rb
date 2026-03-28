@@ -31,8 +31,17 @@ def debian_check
   error 'This script is for Debian-based systems only.' unless File.file?('/etc/debian_version')
 end
 
+def command_executable?(name)
+  ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).each do |dir|
+    next if dir.empty?
+    path = File.join(dir, name)
+    return true if File.file?(path) && File.executable?(path)
+  end
+  false
+end
+
 def installed?
-  system('command -v wg > /dev/null 2>&1')
+  command_executable?('wg')
 end
 
 # Interface name from config filename. With multiple configs, prefers the active one.

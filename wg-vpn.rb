@@ -42,15 +42,25 @@ def debian_check
 end
 
 def get_wan_interface
-  out = capture("ip route show default | awk '/default/ {print $5}'")
-  out.split("\n").first.to_s.strip
+  out, status = Open3.capture2('ip', '-4', 'route', 'show', 'default')
+  return '' unless status.success?
+  # e.g. "default via 192.168.1.1 dev eth0 proto dhcp metric 100"
+  md = out.match(/\bdev\s+(\S+)/)
+  md ? md[1] : ''
 end
 
-def validate_port(port_str, label = 'Port')
+def validate_port(port_str)
   return false unless port_str.to_s.match?(/^\d+$/)
   p = port_str.to_i
   return false if p < 1 || p > 65_535
   true
+end
+
+def validate_vpn_client_ip(ip)
+  md = ip.to_s.match(/\A10\.8\.0\.(\d+)\z/)
+  return false unless md
+  n = md[1].to_i
+  n >= 2 && n <= 254
 end
 
 def validate_proto(proto)
@@ -62,15 +72,25 @@ def validate_client_name(name)
   name.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/)
 end
 
+def command_executable?(name)
+  ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).each do |dir|
+    next if dir.empty?
+    path = File.join(dir, name)
+    return true if File.file?(path) && File.executable?(path)
+  end
+  false
+end
+
 def fetch_public_ip(timeout_sec: 10)
+  abort 'Error: curl not found. Install curl or enter the server endpoint manually.' unless command_executable?('curl')
   urls = ['https://ifconfig.me/ip', 'https://icanhazip.com']
   urls.each do |url|
-    out, err, status = Timeout.timeout(timeout_sec) do
-      Open3.capture3('curl', '-s', '-f', '--max-time', '8', url)
+    out, _err, status = Timeout.timeout(timeout_sec) do
+      Open3.capture3('curl', '-s', '-f', '--max-time', '8', '--proto', '=https', url)
     end
     ip = out.to_s.strip
     return ip if status.success? && ip.match?(/\A[\d.]+\z/)
-  rescue Timeout::Error, Errno::ENOENT
+  rescue Timeout::Error, SystemCallError
     next
   end
   abort 'Error: Could not detect public IP (curl failed or no response). Enter endpoint manually.'
@@ -115,7 +135,7 @@ end
 def apply_wg_config
   if capture('wg', 'show', 'interfaces').include?('wg0')
     puts "Syncing WireGuard configuration..."
-    Tempfile.open('wg_sync') do |f|
+    Tempfile.create(['wg_sync', '']) do |f|
       f.write(capture('wg-quick', 'strip', WG_CONF))
       f.flush
       run('wg', 'syncconf', 'wg0', f.path)
@@ -196,31 +216,35 @@ def forward_interactive
   end
 
   print "External port (e.g. 8080): "
-  ext_port = gets.strip
-  return if ext_port.empty?
+  ext_port = $stdin.gets&.strip
+  return if ext_port.nil? || ext_port.empty?
 
   print "Internal port [#{ext_port}]: "
-  internal_port = gets.strip
-  internal_port = ext_port if internal_port.empty?
+  internal_port = $stdin.gets&.strip
+  internal_port = ext_port if internal_port.nil? || internal_port.empty?
 
   print "Internal IP (e.g. 10.8.0.4) [#{clients.first}]: "
-  internal_ip = gets.strip
-  internal_ip = clients.first if internal_ip.empty?
+  internal_ip = $stdin.gets&.strip
+  internal_ip = clients.first if internal_ip.nil? || internal_ip.empty?
 
   print "Protocol [udp]: "
-  proto = gets.strip
-  proto = 'udp' if proto.empty?
+  proto = $stdin.gets&.strip
+  proto = 'udp' if proto.nil? || proto.empty?
 
-  unless validate_port(ext_port, 'External port')
+  unless validate_port(ext_port)
     puts "Error: Invalid external port (must be 1-65535)."
     return
   end
-  unless validate_port(internal_port, 'Internal port')
+  unless validate_port(internal_port)
     puts "Error: Invalid internal port (must be 1-65535)."
     return
   end
   unless validate_proto(proto)
     puts "Error: Protocol must be tcp or udp."
+    return
+  end
+  unless validate_vpn_client_ip(internal_ip)
+    puts "Error: Internal IP must be a VPN client address in #{VPN_SUBNET} (10.8.0.2–10.8.0.254)."
     return
   end
   add_port_forward(ext_port, internal_ip, internal_port, proto)
@@ -287,9 +311,10 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   root_check
   internal_port ||= ext_port
   proto = proto.to_s.downcase
-  abort "Error: Invalid external port (must be 1-65535)." unless validate_port(ext_port, 'External port')
-  abort "Error: Invalid internal port (must be 1-65535)." unless validate_port(internal_port, 'Internal port')
+  abort "Error: Invalid external port (must be 1-65535)." unless validate_port(ext_port)
+  abort "Error: Invalid internal port (must be 1-65535)." unless validate_port(internal_port)
   abort "Error: Protocol must be tcp or udp." unless validate_proto(proto)
+  abort "Error: Internal IP must be a VPN client address in #{VPN_SUBNET} (10.8.0.2–10.8.0.254)." unless validate_vpn_client_ip(internal_ip)
 
   wan = get_wan_interface
   zone = get_fw_zone
@@ -317,7 +342,7 @@ def add_client
   abort "Error: #{WG_CONF} not found. Run setup first." unless File.file?(WG_CONF)
 
   print "Client Name (e.g., node1): "
-  name = gets.strip.gsub(/\s+/, '-')
+  name = ($stdin.gets || '').strip.gsub(/\s+/, '-')
   abort "Error: Client name cannot be empty." if name.empty?
   abort "Error: Client name must start with a letter or digit and contain only letters, digits, underscores, dots, and hyphens (max 64 chars)." unless validate_client_name(name)
   conf_path = File.join(WG_CLIENTS, "#{name}.conf")
@@ -333,7 +358,7 @@ def add_client
   server_pub = File.read(SERVER_PUB).strip
 
   print "Server endpoint - domain name or IP (Enter = auto-detect IP): "
-  endpoint_input = gets.strip
+  endpoint_input = ($stdin.gets || '').strip
   endpoint = if endpoint_input.empty?
     "#{fetch_public_ip}:#{WG_PORT}"
   elsif endpoint_input.include?(':')
@@ -343,7 +368,7 @@ def add_client
   end
 
   print "Client DNS [#{CLIENT_DNS}]: "
-  dns_input = gets.strip
+  dns_input = ($stdin.gets || '').strip
   client_dns = dns_input.empty? ? CLIENT_DNS : dns_input
 
   client_conf = <<~CONF
@@ -368,7 +393,7 @@ def add_client
   apply_wg_config
 
   puts "\n--- Client Config: #{conf_path} ---"
-  run('qrencode', '-t', 'ansiutf8', '-r', conf_path) if system('which qrencode > /dev/null')
+  run('qrencode', '-t', 'ansiutf8', '-r', conf_path) if command_executable?('qrencode')
   puts "Assigned IP: #{next_ip}"
 end
 
@@ -420,7 +445,7 @@ def remove_client_interactive
   end
   puts "Clients: #{names.join(', ')}"
   print "Client name to remove: "
-  name = gets.strip
+  name = ($stdin.gets || '').strip
   return if name.empty?
   remove_client(name)
 end
@@ -467,7 +492,12 @@ def run_menu
     puts "  7) Status"
     puts "  8) Exit"
     print "Choice: "
-    case gets.strip
+    choice = $stdin.gets
+    unless choice
+      puts "Bye."
+      break
+    end
+    case choice.strip
     when '1' then setup_server
     when '2' then add_client
     when '3' then forward_interactive
