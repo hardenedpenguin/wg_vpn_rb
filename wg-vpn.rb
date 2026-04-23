@@ -22,6 +22,7 @@ VPN_SERVER_IP = '10.8.0.1'
 WG_PORT = 51820
 CLIENT_DNS = '1.1.1.1'
 DEFAULT_MTU = 1420
+CLIENT_ALLOWED_IPS = '0.0.0.0/0'
 
 def get_fw_zone
   capture('firewall-cmd', '--get-default-zone')
@@ -432,7 +433,7 @@ def add_client
     [Peer]
     PublicKey = #{server_pub}
     Endpoint = #{endpoint}
-    AllowedIPs = #{VPN_SUBNET}
+    AllowedIPs = #{CLIENT_ALLOWED_IPS}
     PersistentKeepalive = 25
   CONF
 

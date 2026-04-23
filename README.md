@@ -46,7 +46,7 @@ You must **forward UDP 51820** from your router to this host for clients to conn
 2. Prompts for server endpoint: Enter = auto-detect public IP via **curl** (HTTPS only; tries ifconfig.me/ip and icanhazip.com with timeout), or enter a **domain name** or IP (e.g. `vpn.example.com` or `vpn.example.com:51820`) so clients work when the server has a dynamic IP. **curl** must be installed for auto-detect; otherwise enter the endpoint manually. Duplicate client names are rejected.
 3. Prompts for client DNS (Enter = default `1.1.1.1`).
 4. Generates a client key pair and assigns the next free IP in `10.8.0.0/24`.
-5. Writes the client config: Address, DNS (as chosen), MTU (1420), Peer with Endpoint, AllowedIPs (`10.8.0.0/24`), PersistentKeepalive (25).
+5. Writes the client config: Address, DNS (as chosen), MTU (1420), Peer with Endpoint, AllowedIPs (`0.0.0.0/0` full-tunnel for ASL3), PersistentKeepalive (25).
 6. Appends a `[Peer]` block to `wg0.conf`.
 7. Reloads WireGuard. If `qrencode` is installed, prints a QR code.
 
