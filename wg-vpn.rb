@@ -27,6 +27,46 @@ def get_fw_zone
   capture('firewall-cmd', '--get-default-zone')
 end
 
+def ensure_firewalld_running
+  run('systemctl', 'enable', '--now', 'firewalld')
+end
+
+def ensure_zone(name)
+  ensure_firewalld_running
+  zones = capture('firewall-cmd', '--permanent', '--get-zones').split(/[\s]+/)
+  run('firewall-cmd', '--permanent', "--new-zone=#{name}") unless zones.include?(name)
+end
+
+def zone_for_interface(interface)
+  out, _err, status = Open3.capture3('firewall-cmd', '--get-zone-of-interface', interface)
+  return '' unless status.success?
+  out.to_s.strip
+end
+
+def ensure_wireguard_zone(interface: 'wg0', zone: 'wireguard')
+  current = zone_for_interface(interface)
+  return current unless current.empty?
+
+  ensure_zone(zone)
+  run('firewall-cmd', '--permanent', "--zone=#{zone}", "--add-interface=#{interface}")
+  zone
+end
+
+def ensure_policy(name, ingress_zone:, egress_zone:)
+  ensure_firewalld_running
+  policies = capture('firewall-cmd', '--permanent', '--get-policies').split(/[\s]+/)
+  unless policies.include?(name)
+    run('firewall-cmd', '--permanent', "--new-policy=#{name}")
+  end
+
+  ensure_zone(ingress_zone)
+  ensure_zone(egress_zone)
+
+  run('firewall-cmd', '--permanent', "--policy=#{name}", "--add-ingress-zone=#{ingress_zone}")
+  run('firewall-cmd', '--permanent', "--policy=#{name}", "--add-egress-zone=#{egress_zone}")
+  run('firewall-cmd', '--permanent', "--policy=#{name}", '--set-target=ACCEPT')
+end
+
 def run(*cmd)
   system(*cmd) || (raise "Command failed: #{cmd.join(' ')}")
 end
@@ -318,6 +358,11 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
 
   wan = get_wan_interface
   zone = get_fw_zone
+  wg_zone = zone_for_interface('wg0')
+  if wg_zone.empty?
+    wg_zone = ensure_wireguard_zone(interface: 'wg0', zone: 'wireguard')
+  end
+  use_policy = (wg_zone != zone)
   forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
   if system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
     puts "Forward already configured."
@@ -325,13 +370,19 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   end
 
   rich_rule = "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{proto}' accept"
-  existing_rules = capture('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--list-rich-rules')
-  add_rich_rule = !existing_rules.include?(rich_rule)
+  rule_target = use_policy ? ['--policy=wan-to-wg'] : ["--zone=#{zone}"]
+  ensure_policy('wan-to-wg', ingress_zone: zone, egress_zone: wg_zone) if use_policy
+  existing_rules = begin
+    capture('firewall-cmd', '--permanent', *rule_target, '--list-rich-rules')
+  rescue RuntimeError
+    ''
+  end
+  add_rich_rule = existing_rules.empty? || !existing_rules.include?(rich_rule)
 
   puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{internal_port} (#{proto})"
 
   run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port', forward_spec)
-  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-rich-rule', rich_rule) if add_rich_rule
+  run('firewall-cmd', '--permanent', *rule_target, '--add-rich-rule', rich_rule) if add_rich_rule
 
   run('firewall-cmd', '--reload')
   puts "Done."
