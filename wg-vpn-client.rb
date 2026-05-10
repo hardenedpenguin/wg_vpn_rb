@@ -61,9 +61,12 @@ def setup(config_path = nil)
   debian_check
 
   unless installed?
-    info 'Installing WireGuard and dependencies...'
+    # Userspace only (wg, wg-quick). Do not install the wireguard metapackage or
+    # recommends: those can pull wireguard-dkms and linux-headers, which fail or
+    # bloat Chromebook / non-Debian-kernel environments where the module is in-tree.
+    info 'Installing WireGuard tools and dependencies...'
     run('apt-get', 'update')
-    run('apt-get', 'install', '-y', 'wireguard', 'resolvconf')
+    run('apt-get', 'install', '-y', '--no-install-recommends', 'wireguard-tools', 'resolvconf')
   end
 
   config_path ||= (print 'Path to client config file: '; $stdin.gets&.strip)
