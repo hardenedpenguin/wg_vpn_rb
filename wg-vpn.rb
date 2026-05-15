@@ -3,7 +3,7 @@
 #
 # WireGuard VPN server manager for Debian.
 # Uses firewalld policies (no direct rules).
-# Run with no args for menu, or: setup | add-client | remove-client [name] | forward | list-forwards | list-clients | status
+# Run with no args for menu, or: setup | add-client | remove-client [name] | forward | remove-forward | list-forwards | list-clients | status
 #
 
 require 'fileutils'
@@ -106,6 +106,44 @@ end
 
 def validate_proto(proto)
   %w[tcp udp].include?(proto.to_s.downcase)
+end
+
+def port_forward_rich_rule(internal_ip, internal_port, proto)
+  p = proto.to_s.downcase
+  "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{p}' accept"
+end
+
+# WAN zone + where per-forward rich rules live (policy when wg0 is in a separate zone).
+def port_forward_wan_zone_and_rule_target
+  zone = get_fw_zone
+  wg_zone = zone_for_interface('wg0')
+  wg_zone = ensure_wireguard_zone(interface: 'wg0', zone: 'wireguard') if wg_zone.empty?
+  use_policy = (wg_zone != zone)
+  ensure_policy('wan-to-wg', ingress_zone: zone, egress_zone: wg_zone) if use_policy
+  rule_target = use_policy ? ['--policy=wan-to-wg'] : ["--zone=#{zone}"]
+  [zone, rule_target]
+end
+
+def permanent_forward_port_lines(zone)
+  out = capture('firewall-cmd', '--permanent', "--zone=#{zone}", '--list-forward-ports')
+  out.split("\n").map(&:strip).reject(&:empty?)
+end
+
+def forward_still_targets_internal?(zone, internal_ip, internal_port, proto)
+  p = internal_port.to_s
+  pr = proto.to_s.downcase
+  permanent_forward_port_lines(zone).any? do |line|
+    line =~ %r{\Aport=\d+:proto=(\w+):toport=(\d+):toaddr=(\S+)\z} &&
+      Regexp.last_match(3) == internal_ip &&
+      Regexp.last_match(2) == p &&
+      Regexp.last_match(1).downcase == pr
+  end
+end
+
+def permanent_rich_rules(rule_target)
+  capture('firewall-cmd', '--permanent', *rule_target, '--list-rich-rules')
+rescue RuntimeError
+  ''
 end
 
 def validate_client_name(name)
@@ -291,6 +329,51 @@ def forward_interactive
   add_port_forward(ext_port, internal_ip, internal_port, proto)
 end
 
+def remove_forward_interactive
+  root_check
+  clients = list_client_ips
+  if clients.any?
+    puts "Clients: #{clients.join(', ')}"
+  else
+    puts "No clients yet. Run 'add-client' first."
+    return
+  end
+
+  print "External port to stop forwarding: "
+  ext_port = $stdin.gets&.strip
+  return if ext_port.nil? || ext_port.empty?
+
+  print "Internal port [#{ext_port}]: "
+  internal_port = $stdin.gets&.strip
+  internal_port = ext_port if internal_port.nil? || internal_port.empty?
+
+  print "Internal IP (e.g. 10.8.0.4) [#{clients.first}]: "
+  internal_ip = $stdin.gets&.strip
+  internal_ip = clients.first if internal_ip.nil? || internal_ip.empty?
+
+  print "Protocol [udp]: "
+  proto = $stdin.gets&.strip
+  proto = 'udp' if proto.nil? || proto.empty?
+
+  unless validate_port(ext_port)
+    puts "Error: Invalid external port (must be 1-65535)."
+    return
+  end
+  unless validate_port(internal_port)
+    puts "Error: Invalid internal port (must be 1-65535)."
+    return
+  end
+  unless validate_proto(proto)
+    puts "Error: Protocol must be tcp or udp."
+    return
+  end
+  unless validate_vpn_client_ip(internal_ip)
+    puts "Error: Internal IP must be a VPN client address in #{VPN_SUBNET} (10.8.0.2–10.8.0.254)."
+    return
+  end
+  remove_port_forward(ext_port, internal_ip, internal_port, proto)
+end
+
 def list_forwards
   root_check
   zone = get_fw_zone
@@ -358,26 +441,15 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   abort "Error: Internal IP must be a VPN client address in #{VPN_SUBNET} (10.8.0.2–10.8.0.254)." unless validate_vpn_client_ip(internal_ip)
 
   wan = get_wan_interface
-  zone = get_fw_zone
-  wg_zone = zone_for_interface('wg0')
-  if wg_zone.empty?
-    wg_zone = ensure_wireguard_zone(interface: 'wg0', zone: 'wireguard')
-  end
-  use_policy = (wg_zone != zone)
+  zone, rule_target = port_forward_wan_zone_and_rule_target
   forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
   if system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
     puts "Forward already configured."
     return
   end
 
-  rich_rule = "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{proto}' accept"
-  rule_target = use_policy ? ['--policy=wan-to-wg'] : ["--zone=#{zone}"]
-  ensure_policy('wan-to-wg', ingress_zone: zone, egress_zone: wg_zone) if use_policy
-  existing_rules = begin
-    capture('firewall-cmd', '--permanent', *rule_target, '--list-rich-rules')
-  rescue RuntimeError
-    ''
-  end
+  rich_rule = port_forward_rich_rule(internal_ip, internal_port, proto)
+  existing_rules = permanent_rich_rules(rule_target)
   add_rich_rule = existing_rules.empty? || !existing_rules.include?(rich_rule)
 
   puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{internal_port} (#{proto})"
@@ -387,6 +459,34 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
 
   run('firewall-cmd', '--reload')
   puts "Done."
+end
+
+def remove_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
+  root_check
+  internal_port ||= ext_port
+  proto = proto.to_s.downcase
+  abort "Error: Invalid external port (must be 1-65535)." unless validate_port(ext_port)
+  abort "Error: Invalid internal port (must be 1-65535)." unless validate_port(internal_port)
+  abort "Error: Protocol must be tcp or udp." unless validate_proto(proto)
+  abort "Error: Internal IP must be a VPN client address in #{VPN_SUBNET} (10.8.0.2–10.8.0.254)." unless validate_vpn_client_ip(internal_ip)
+
+  zone, rule_target = port_forward_wan_zone_and_rule_target
+  forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
+  unless system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
+    puts "No matching permanent forward (#{forward_spec})."
+    return
+  end
+
+  run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', forward_spec)
+
+  unless forward_still_targets_internal?(zone, internal_ip, internal_port, proto)
+    rich_rule = port_forward_rich_rule(internal_ip, internal_port, proto)
+    existing = permanent_rich_rules(rule_target)
+    run('firewall-cmd', '--permanent', *rule_target, '--remove-rich-rule', rich_rule) if existing.include?(rich_rule)
+  end
+
+  run('firewall-cmd', '--reload')
+  puts "Removed forward #{ext_port}/#{proto} -> #{internal_ip}:#{internal_port}."
 end
 
 def add_client
@@ -450,21 +550,25 @@ def add_client
 end
 
 def remove_port_forwards_for(client_ip)
-  zone = get_fw_zone
-  forwards = capture('firewall-cmd', '--permanent', "--zone=#{zone}", '--list-forward-ports')
-  removed = false
-  forwards.split("\n").each do |line|
-    line = line.strip
-    next if line.empty?
-    next unless line.include?("toaddr=#{client_ip}")
-    run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
+  zone, rule_target = port_forward_wan_zone_and_rule_target
+  to_remove = permanent_forward_port_lines(zone).select { |l| l.include?("toaddr=#{client_ip}") }
+  return if to_remove.empty?
+
+  rich_pairs = []
+  to_remove.each do |line|
     if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=/
-      run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--remove-rich-rule',
-          "rule family='ipv4' destination address='#{client_ip}' port port='#{$3}' protocol='#{$2}' accept")
+      rich_pairs << [Regexp.last_match(3), Regexp.last_match(2).downcase]
     end
-    removed = true
+    run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
   end
-  run('firewall-cmd', '--reload') if removed
+
+  rich_pairs.uniq.each do |internal_port, proto|
+    rich_rule = port_forward_rich_rule(client_ip, internal_port, proto)
+    existing = permanent_rich_rules(rule_target)
+    run('firewall-cmd', '--permanent', *rule_target, '--remove-rich-rule', rich_rule) if existing.include?(rich_rule)
+  end
+
+  run('firewall-cmd', '--reload')
 end
 
 def remove_peer_block_from_conf(client_ip)
@@ -542,7 +646,8 @@ def run_menu
     puts "  5) List forwards"
     puts "  6) List clients"
     puts "  7) Status"
-    puts "  8) Exit"
+    puts "  8) Remove port forward"
+    puts "  9) Exit"
     print "Choice: "
     choice = $stdin.gets
     unless choice
@@ -557,7 +662,8 @@ def run_menu
     when '5' then list_forwards
     when '6' then list_clients
     when '7' then run('wg', 'show')
-    when '8' then puts "Bye."; break
+    when '8' then remove_forward_interactive
+    when '9' then puts "Bye."; break
     else puts "Invalid choice."
     end
   end
@@ -585,11 +691,24 @@ when 'forward'
   else
     forward_interactive
   end
+when 'remove-forward'
+  if ARGV[1] && ARGV[2]
+    ext_port, internal_ip = ARGV[1], ARGV[2]
+    if ARGV[4]
+      remove_port_forward(ext_port, internal_ip, ARGV[3], ARGV[4])
+    elsif ARGV[3]
+      remove_port_forward(ext_port, internal_ip, ARGV[3] =~ /^\d+$/ ? ARGV[3] : nil, ARGV[3] =~ /^\d+$/ ? 'udp' : ARGV[3])
+    else
+      remove_port_forward(ext_port, internal_ip)
+    end
+  else
+    remove_forward_interactive
+  end
 when 'list-forwards' then list_forwards
 when 'list-clients'  then list_clients
 when 'status'        then run('wg', 'show')
 when nil, 'menu'     then run_menu
 else
-  puts "Commands: setup | add-client | remove-client [name] | forward [...] | list-forwards | list-clients | status"
+  puts "Commands: setup | add-client | remove-client [name] | forward [...] | remove-forward [...] | list-forwards | list-clients | status"
   puts "Run with no args for menu."
 end

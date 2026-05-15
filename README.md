@@ -66,6 +66,12 @@ Forwards a port on the server’s WAN interface to a VPN client. **Preserves sou
 
 1. Adds a forward-port (DNAT) to the WAN zone and a per-port rich rule on the wan-to-wg policy (required so physical→virtual forwarding is allowed). Ports (1–65535), protocol (tcp/udp), and internal IP (must be a VPN client address `10.8.0.2`–`10.8.0.254`) are validated. Re-running the same forward is idempotent; rich rules are not duplicated.
 
+### Remove port forward (`remove-forward`)
+
+Removes one permanent forward without removing the client. Arguments mirror `forward` (external port, internal VPN IP, optional internal port, tcp/udp).
+
+If you had multiple external ports mapped to the **same** internal IP, port, and protocol, the accept rich rule is removed only after the **last** such forward is removed (same behavior as add: one rich rule can cover several DNAT entries).
+
 ---
 
 ## Usage
@@ -80,7 +86,7 @@ Run with no arguments for a menu:
 sudo ./wg-vpn.rb
 ```
 
-The menu prompts for each action. For port forwarding, it lists existing clients and asks for external port, internal port (defaults to external), internal IP, and protocol.
+The menu prompts for each action. For **forward port**, it lists existing clients and asks for external port, internal port (defaults to external), internal IP, and protocol. **Remove port forward** uses the same fields so you remove the exact forward you added. Exit is option **9**.
 
 ### Commands (non-interactive)
 
@@ -90,6 +96,7 @@ The menu prompts for each action. For port forwarding, it lists existing clients
 | `add-client` | Add a client; prompts for name, endpoint, DNS |
 | `remove-client [name]` | Remove client, port forwards, and config; prompts for confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
+| `remove-forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Remove one port forward (same argument pattern as `forward`). Without args: interactive prompts. |
 | `list-forwards` | List active port forwards (ext port, proto, internal IP, client name) |
 | `list-clients` | List clients (name and VPN IP); also shows orphan peers (in wg0 only, no config file) |
 | `status`  | Show `wg show` |
@@ -133,6 +140,14 @@ sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp
 ```
 
 On your router, forward the external port(s) to the server so clients are reachable.
+
+**Remove a port forward (keep the client)**
+
+```bash
+sudo ./wg-vpn.rb remove-forward 4570 10.8.0.4 udp
+sudo ./wg-vpn.rb remove-forward 8080 10.8.0.4 80 tcp
+sudo ./wg-vpn.rb remove-forward   # Interactive
+```
 
 **List port forwards**
 
@@ -211,6 +226,8 @@ sudo ./wg-vpn.rb remove-client portable2
 sudo ./wg-vpn.rb forward      # Interactive
 sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp   # ext→int port
+sudo ./wg-vpn.rb remove-forward 4570 10.8.0.4 udp
+sudo ./wg-vpn.rb remove-forward 8080 10.8.0.4 80 tcp
 sudo ./wg-vpn.rb list-forwards
 sudo ./wg-vpn.rb list-clients
 sudo ./wg-vpn.rb status
