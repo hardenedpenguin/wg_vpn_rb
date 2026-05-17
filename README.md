@@ -182,9 +182,11 @@ sudo ./wg-vpn.rb status
 
 ## Client script (Debian)
 
-**wg-vpn-client.rb** is a client-side script for **Debian**. It installs WireGuard, copies your client config into `/etc/wireguard`, removes the source file (so only the secured copy remains), brings up the tunnel, and optionally enables it on boot.
+**wg-vpn-client.rb** is a client-side script for **Debian**. It installs WireGuard, copies your client config into `/etc/wireguard`, removes the source file (so only the secured copy remains), brings up the tunnel, verifies connectivity, and optionally enables it on boot.
 
 **Requirements:** root, Debian.
+
+**Connection check:** After `wg-quick up`, configs with a `DNS =` line use **openresolv** (provides the `resolvconf` command) to point the system resolver at VPN DNS. That breaks hostname-based checks (`curl`, `ping google.com`) right after bring-up. The client script therefore verifies the tunnel using a **WireGuard handshake** and an optional **ping to the VPN gateway** (`10.8.0.1` on the tunnel, via the WireGuard interface)—no DNS. Set `WG_SKIP_VERIFY=1` to skip verification on `up`.
 
 **Commands:**
 
@@ -194,6 +196,7 @@ sudo ./wg-vpn.rb status
 | `up [interface]`  | Bring up tunnel (auto-detect interface if single config) |
 | `down [interface]`| Bring down tunnel |
 | `status [interface]` | Show `wg show` |
+| `check [interface]` | Verify handshake and ping VPN gateway (no DNS) |
 | `list`            | List configs and which interface is up |
 | `enable-boot [interface]` | Enable tunnel on boot |
 | `disable-boot [interface]` | Disable tunnel on boot |
@@ -210,7 +213,7 @@ sudo ./wg-vpn.rb status
    Or run `sudo ./wg-vpn-client.rb setup` and enter the path when prompted. The source file is removed after copying; only the copy in `/etc/wireguard` is kept.
 3. Say **y** when asked to enable on boot if you want the tunnel to start automatically.
 
-The interface name is derived from the config filename: only the `.conf` extension is stripped, and letters, digits, underscores, dots, and hyphens are kept (e.g. `node1.conf` → `node1`, `my.node.conf` → `my.node`). With one config in `/etc/wireguard`, `up`, `down`, `status`, `enable-boot`, and `disable-boot` auto-detect the interface.
+The interface name is derived from the config filename: only the `.conf` extension is stripped, and letters, digits, underscores, dots, and hyphens are kept (e.g. `node1.conf` → `node1`, `my.node.conf` → `my.node`). With one config in `/etc/wireguard`, `up`, `down`, `status`, `check`, `enable-boot`, and `disable-boot` auto-detect the interface.
 
 ---
 
@@ -240,6 +243,7 @@ sudo ./wg-vpn-client.rb setup ./node1.conf
 sudo ./wg-vpn-client.rb up
 sudo ./wg-vpn-client.rb down
 sudo ./wg-vpn-client.rb status
+sudo ./wg-vpn-client.rb check
 sudo ./wg-vpn-client.rb list
 sudo ./wg-vpn-client.rb enable-boot
 sudo ./wg-vpn-client.rb disable-boot
