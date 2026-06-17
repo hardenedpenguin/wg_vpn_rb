@@ -266,12 +266,20 @@ def setup_server
 
   zones = capture('firewall-cmd', '--permanent', '--get-zones').split(/[\s]+/)
   run('firewall-cmd', '--permanent', '--new-zone=wireguard') unless zones.include?('wireguard')
-  run('firewall-cmd', '--permanent', '--zone=wireguard', '--add-interface=wg0')
+
+  wg_zone = zone_for_interface('wg0')
+  if wg_zone.empty?
+    run('firewall-cmd', '--permanent', '--zone=wireguard', '--add-interface=wg0')
+    wg_zone = 'wireguard'
+  else
+    puts "Keeping wg0 in existing zone: #{wg_zone}"
+  end
+
   run('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--add-port', "#{WG_PORT}/udp")
 
   policies = capture('firewall-cmd', '--permanent', '--get-policies').split(/[\s]+/)
   run('firewall-cmd', '--permanent', '--new-policy=wg-to-wan') unless policies.include?('wg-to-wan')
-  run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--add-ingress-zone=wireguard')
+  run('firewall-cmd', '--permanent', '--policy=wg-to-wan', "--add-ingress-zone=#{wg_zone}")
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', "--add-egress-zone=#{wan_zone}")
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--set-target=ACCEPT')
   run('firewall-cmd', '--permanent', '--policy=wg-to-wan', '--add-rich-rule',
@@ -279,7 +287,7 @@ def setup_server
 
   run('firewall-cmd', '--permanent', '--new-policy=wan-to-wg') unless policies.include?('wan-to-wg')
   run('firewall-cmd', '--permanent', '--policy=wan-to-wg', "--add-ingress-zone=#{wan_zone}")
-  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--add-egress-zone=wireguard')
+  run('firewall-cmd', '--permanent', '--policy=wan-to-wg', "--add-egress-zone=#{wg_zone}")
   run('firewall-cmd', '--permanent', '--policy=wan-to-wg', '--set-target=ACCEPT')
 
   run('firewall-cmd', '--reload')
