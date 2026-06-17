@@ -232,9 +232,12 @@ def setup_server
   wan_zone = get_fw_zone
   puts "Detected WAN: #{wan} (zone: #{wan_zone})"
 
-  puts 'Installing WireGuard and Firewalld...'
+  puts 'Installing WireGuard tools and Firewalld...'
   run('apt-get', 'update')
-  run('apt-get', 'install', '-y', 'wireguard', 'firewalld', 'resolvconf', 'qrencode')
+  # Userspace only (wg, wg-quick). Do not install the wireguard metapackage: it can
+  # pull wireguard-dkms and linux-headers when the running kernel already has WireGuard.
+  # openresolv provides the resolvconf command wg-quick uses for DNS= lines (same as client).
+  run('apt-get', 'install', '-y', '--no-install-recommends', 'wireguard-tools', 'firewalld', 'openresolv', 'qrencode')
 
   File.open('/etc/sysctl.d/99-wireguard.conf', 'w') { |f| f.puts "net.ipv4.ip_forward=1" }
   run('sysctl', '-p', '/etc/sysctl.d/99-wireguard.conf')

@@ -27,7 +27,7 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 
 Requires **Debian** (or derivative) and a **default route**. Exits with an error if not.
 
-1. Installs **wireguard**, **firewalld**, **resolvconf**, **qrencode** via `apt`.
+1. Installs **wireguard-tools**, **firewalld**, **openresolv**, **qrencode** via `apt` (userspace only; does not install `wireguard-dkms` or kernel headers). **openresolv** provides the `resolvconf` command `wg-quick` uses if a config has `DNS =`.
 2. Enables IPv4 forwarding (`net.ipv4.ip_forward=1`) in `/etc/sysctl.d/99-wireguard.conf`.
 3. Creates `/etc/wireguard` and `/etc/wireguard/clients`, generates server key pair if missing.
 4. Writes initial `wg0.conf` with `MTU = 1420` if it does not exist.
@@ -249,6 +249,6 @@ sudo ./wg-vpn-client.rb enable-boot
 sudo ./wg-vpn-client.rb disable-boot
 ```
 
-- **Server**: Debian, root, wireguard + firewalld + resolvconf (+ qrencode for QR).
+- **Server**: Debian, root, wireguard-tools + firewalld + openresolv (+ qrencode for QR).
 - **After setup**: Forward UDP 51820 (and any forwarded ports like 4570) to the server.
 - **Clients**: Use the `.conf` (or QR) from `add-client`. Run `wg-vpn-client.rb setup` on the client; the source config is removed after copying.
