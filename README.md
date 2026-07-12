@@ -27,15 +27,14 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 
 Requires **Debian** (or derivative) and a **default route**. Exits with an error if not.
 
-1. Installs **wireguard-tools**, **firewalld**, **openresolv**, **qrencode** via `apt` (userspace only; does not install `wireguard-dkms` or kernel headers). **openresolv** provides the `resolvconf` command `wg-quick` uses if a config has `DNS =`.
+1. Installs **wireguard-tools**, **firewalld**, **openresolv**, **qrencode**, **curl** via `apt` (userspace only; does not install `wireguard-dkms` or kernel headers). **openresolv** provides the `resolvconf` command `wg-quick` uses if a config has `DNS =`.
 2. Enables IPv4 forwarding (`net.ipv4.ip_forward=1`) in `/etc/sysctl.d/99-wireguard.conf`.
 3. Creates `/etc/wireguard` and `/etc/wireguard/clients`, generates server key pair if missing.
 4. Writes initial `wg0.conf` with `MTU = 1420` if it does not exist.
 5. Configures firewalld (policy-based, no direct rules):
-   - Creates **wireguard** zone for `wg0`; WAN stays in default zone (e.g. `public` or `allstarlink`).
-   - Opens UDP **51820** on WAN zone.
-   - **wg-to-wan** policy: VPN→internet with targeted masquerade (source 10.8.0.0/24 only).
-   - **wan-to-wg** policy: WAN→VPN for port forwards (no masquerade; preserves source IP for ASL3).
+   - Creates **wireguard** zone if needed; **keeps `wg0` in its existing zone** when already assigned (runtime, permanent config, or zone XML — e.g. **allstarlink** on a single-zone VPS). Does not move `wg0` if it is already bound elsewhere.
+   - Opens UDP **51820** on WAN zone (skipped if already open).
+   - **wg-to-wan** / **wan-to-wg** policies and masquerade are idempotent (safe to re-run `setup`).
 6. Enables and starts `wg-quick@wg0`.
 
 You must **forward UDP 51820** from your router to this host for clients to connect.
@@ -68,7 +67,7 @@ Forwards a port on the server’s WAN interface to a VPN client. **Preserves sou
 
 ### Remove port forward (`remove-forward`)
 
-Removes one permanent forward without removing the client. Arguments mirror `forward` (external port, internal VPN IP, optional internal port, tcp/udp).
+Removes one permanent forward without removing the client. Arguments mirror `forward` (external port, internal VPN IP, optional internal port, tcp/udp). You can also remove by **external port only** when a single forward matches: `remove-forward 4570` or `remove-forward 4570 udp`.
 
 If you had multiple external ports mapped to the **same** internal IP, port, and protocol, the accept rich rule is removed only after the **last** such forward is removed (same behavior as add: one rich rule can cover several DNAT entries).
 
@@ -94,11 +93,12 @@ The menu prompts for each action. For **forward port**, it lists existing client
 |-----------|-------------|
 | `setup`   | Install packages, configure firewall, create server config, start WireGuard |
 | `add-client` | Add a client; prompts for name, endpoint, DNS |
-| `remove-client [name]` | Remove client, port forwards, and config; prompts for confirmation |
+| `remove-client [-y] [name]` | Remove client, port forwards, and config; `-y` or `WG_YES=1` skips confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
-| `remove-forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Remove one port forward (same argument pattern as `forward`). Without args: interactive prompts. |
+| `remove-forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Remove one port forward. `remove-forward EXT [proto]` when only one forward uses that port. |
 | `list-forwards` | List active port forwards (ext port, proto, internal IP, client name) |
 | `list-clients` | List clients (name and VPN IP); also shows orphan peers (in wg0 only, no config file) |
+| `export` | Tar `/etc/wireguard` and write a manifest with zone info and re-add-forward commands |
 | `status`  | Show `wg show` |
 
 ### Examples
@@ -146,7 +146,15 @@ On your router, forward the external port(s) to the server so clients are reacha
 ```bash
 sudo ./wg-vpn.rb remove-forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb remove-forward 8080 10.8.0.4 80 tcp
+sudo ./wg-vpn.rb remove-forward 4570 udp   # by external port when unique
 sudo ./wg-vpn.rb remove-forward   # Interactive
+```
+
+**Export before migration**
+
+```bash
+sudo ./wg-vpn.rb export
+# Creates wg-vpn-export-*.tar.gz and a manifest with forward re-add commands
 ```
 
 **List port forwards**
@@ -176,7 +184,18 @@ sudo ./wg-vpn.rb status
 - On add, you can enter a **domain name** (e.g. `vpn.example.com`) as the server endpoint so clients keep working when the server's public IP changes (dynamic IP / DHCP).
 - On add, if `qrencode` is installed, a QR code is printed; mobile apps can scan it.
 - Client DNS defaults to `1.1.1.1`; you can override it when adding a client (prompt), or edit the config file afterward.
-- AllowedIPs is `10.8.0.0/24` (VPN subnet). Removed client configs are backed up under `/etc/wireguard/clients/removed/`.
+- AllowedIPs is `0.0.0.0/0` (full tunnel for ASL3). Removed client configs are backed up under `/etc/wireguard/clients/removed/`.
+
+### Migrating the server (e.g. mustang → new host)
+
+1. On the old server: `sudo ./wg-vpn.rb export` (or `tar czf … -C /etc wireguard`).
+2. Copy `/etc/firewalld` if you use a custom zone (e.g. **allstarlink** with `wg0` + WAN on the same zone).
+3. On the new host: restore firewalld first; ensure **`wg0` appears in only one zone XML** (not both `wireguard` and `allstarlink`).
+4. Restore `/etc/wireguard`, then `systemctl start wg-quick@wg0`.
+5. Re-run `setup` only for missing packages — it will **not** move `wg0` out of **allstarlink** if already assigned.
+6. Update router NAT (UDP 51820 + forwarded ports) and client **Endpoint** only if the public IP/hostname changed.
+
+**Clients (mustang, crazytrain, etc.)** are unchanged unless the server public endpoint changes; they are independent of server migration.
 
 ---
 
@@ -231,6 +250,7 @@ sudo ./wg-vpn.rb forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb forward 8080 10.8.0.4 80 tcp   # ext→int port
 sudo ./wg-vpn.rb remove-forward 4570 10.8.0.4 udp
 sudo ./wg-vpn.rb remove-forward 8080 10.8.0.4 80 tcp
+sudo ./wg-vpn.rb export
 sudo ./wg-vpn.rb list-forwards
 sudo ./wg-vpn.rb list-clients
 sudo ./wg-vpn.rb status
@@ -249,6 +269,6 @@ sudo ./wg-vpn-client.rb enable-boot
 sudo ./wg-vpn-client.rb disable-boot
 ```
 
-- **Server**: Debian, root, wireguard-tools + firewalld + openresolv (+ qrencode for QR).
+- **Server**: Debian, root, wireguard-tools + firewalld + openresolv + curl (+ qrencode for QR).
 - **After setup**: Forward UDP 51820 (and any forwarded ports like 4570) to the server.
 - **Clients**: Use the `.conf` (or QR) from `add-client`. Run `wg-vpn-client.rb setup` on the client; the source config is removed after copying.
