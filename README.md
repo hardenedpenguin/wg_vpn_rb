@@ -96,7 +96,7 @@ The menu prompts for each action. For **forward port**, it lists existing client
 | `remove-client [-y] [name]` | Remove client, port forwards, and config; `-y` or `WG_YES=1` skips confirmation |
 | `forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Port forward. With args: direct. Without args: interactive prompts. |
 | `remove-forward [EXT_PORT] [INTERNAL_IP] [INTERNAL_PORT] [proto]` | Remove one port forward. `remove-forward EXT [proto]` when only one forward uses that port. |
-| `list-forwards` | List active port forwards (ext port, proto, internal IP, client name) |
+| `list-forwards` | List port forwards (ext port, proto, internal IP, client name), both plain `forward-port` entries and rich-rule forwards; also shows legacy direct DNAT rules (read-only) |
 | `list-clients` | List clients (name and VPN IP); also shows orphan peers (in wg0 only, no config file) |
 | `export` | Tar `/etc/wireguard` and write a manifest with zone info and re-add-forward commands |
 | `status`  | Show `wg show` |

@@ -165,18 +165,23 @@ end
 
 def parse_forward_spec(line)
   return nil unless line =~ /\Aport=(\d+):proto=(\w+):toport=(\d+):toaddr=(\S+)\z/
-  { ext: Regexp.last_match(1), proto: Regexp.last_match(2).downcase,
-    int_port: Regexp.last_match(3), ip: Regexp.last_match(4), line: line }
+  { kind: :port, ext: Regexp.last_match(1), proto: Regexp.last_match(2).downcase,
+    int_port: Regexp.last_match(3), ip: Regexp.last_match(4), dest: nil, line: line }
 end
 
-def forwards_matching_ext_port(zone, ext_port, proto = nil)
-  permanent_forward_port_lines(zone).filter_map do |line|
-    spec = parse_forward_spec(line)
-    next unless spec
-    next unless spec[:ext] == ext_port.to_s
-    next if proto && spec[:proto] != proto.to_s.downcase
-    spec
-  end
+# Rich-rule forward, e.g. rule family="ipv4" destination address="10.10.2.3"
+#   forward-port port="4569" protocol="udp" to-port="4569" to-addr="10.8.0.7"
+def parse_rich_forward(rule)
+  return nil unless rule.include?('forward-port')
+  attr = ->(name) { rule[/\b#{name}=["']([^"']+)["']/, 1] }
+  fwd = rule[/forward-port\s+(.*)\z/, 1].to_s
+  ext = fwd[/(?<![-\w])port=["'](\d+)["']/, 1]
+  proto = fwd[/\bprotocol=["'](\w+)["']/, 1]
+  ip = attr.call('to-addr')
+  return nil unless ext && proto && ip
+  dest = rule[/destination\s+address=["']([^"']+)["']/, 1]
+  { kind: :rich, ext: ext, proto: proto.downcase, int_port: attr.call('to-port') || ext,
+    ip: ip, dest: dest, line: rule }
 end
 
 def permanent_forward_port_lines(zone)
@@ -184,15 +189,39 @@ def permanent_forward_port_lines(zone)
   out.split("\n").map(&:strip).reject(&:empty?)
 end
 
-def forward_still_targets_internal?(zone, internal_ip, internal_port, proto)
-  p = internal_port.to_s
-  pr = proto.to_s.downcase
-  permanent_forward_port_lines(zone).any? do |line|
-    line =~ %r{\Aport=\d+:proto=(\w+):toport=(\d+):toaddr=(\S+)\z} &&
-      Regexp.last_match(3) == internal_ip &&
-      Regexp.last_match(2) == p &&
-      Regexp.last_match(1).downcase == pr
+# Read-only: plain forward-ports plus rich-rule forwards in the zone.
+def forward_entries(zone)
+  plain = permanent_forward_port_lines(zone).filter_map { |line| parse_forward_spec(line) }
+  rich = permanent_rich_rules(["--zone=#{zone}"]).split("\n").map(&:strip).filter_map { |r| parse_rich_forward(r) }
+  plain + rich
+end
+
+def remove_forward_entry(zone, entry)
+  if entry[:kind] == :rich
+    run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-rich-rule', entry[:line])
+  else
+    run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', entry[:line])
   end
+end
+
+def forwards_matching_ext_port(zone, ext_port, proto = nil)
+  forward_entries(zone).select do |e|
+    e[:ext] == ext_port.to_s && (proto.nil? || e[:proto] == proto.to_s.downcase)
+  end
+end
+
+def forward_still_targets_internal?(zone, internal_ip, internal_port, proto)
+  forward_entries(zone).any? do |e|
+    e[:ip] == internal_ip && e[:int_port] == internal_port.to_s && e[:proto] == proto.to_s.downcase
+  end
+end
+
+# Legacy iptables DNATs from firewalld direct rules (shown only; not managed here).
+def direct_dnat_rules
+  out = capture('firewall-cmd', '--permanent', '--direct', '--get-all-rules')
+  out.split("\n").map(&:strip).select { |l| l.include?('-j DNAT') }
+rescue RuntimeError
+  []
 end
 
 def permanent_rich_rules(rule_target)
@@ -440,26 +469,27 @@ end
 def list_forwards
   root_check
   zone = get_fw_zone
-  forwards = capture('firewall-cmd', '--permanent', "--zone=#{zone}", '--list-forward-ports')
-  lines = forwards.split("\n").map(&:strip).reject(&:empty?)
-  if lines.empty?
-    puts "No port forwards configured."
-    return
-  end
-  ip_to_name = {}
+  entries = forward_entries(zone).sort_by { |e| [e[:ext].to_i, e[:proto]] }
+  direct = direct_dnat_rules
+
   ip_to_name = File.file?(WG_CONF) ? File.read(WG_CONF).scan(/# Name = ([^\n]+)\s*\n.*?AllowedIPs = (10\.8\.0\.\d+)/m).to_h { |name, ip| [ip, name.strip] } : {}
-  puts "Port forwards (#{zone}):"
-  puts "  Ext Port  Proto  ->  Internal           Client"
-  puts "  " + "-" * 50
-  lines.each do |line|
-    if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=(10\.8\.0\.\d+)/
-      ext, proto, int, ip = $1, $2, $3, $4
-      name = ip_to_name[ip] || "-"
-      puts "  %-8s  %-4s   ->  %s:%-5s  %s" % [ext, proto, ip, int, name]
-    else
-      puts "  #{line}"
+
+  if entries.empty?
+    puts "No port forwards configured."
+  else
+    puts "Port forwards (#{zone}):"
+    puts "  Ext Port  Proto  ->  Internal           Client        Type"
+    puts "  " + "-" * 64
+    entries.each do |e|
+      type = e[:kind] == :rich ? "rich#{e[:dest] ? " (dst #{e[:dest]})" : ''}" : 'forward-port'
+      puts "  %-8s  %-4s   ->  %-17s  %-12s  %s" % [e[:ext], e[:proto], "#{e[:ip]}:#{e[:int_port]}", ip_to_name[e[:ip]] || '-', type]
     end
   end
+
+  return if direct.empty?
+  puts
+  puts "Legacy direct DNAT rules (not managed by this script):"
+  direct.each { |l| puts "  #{l}" }
 end
 
 def list_clients
@@ -506,9 +536,14 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   wan = get_wan_interface
   zone, rule_target = port_forward_wan_zone_and_rule_target
   forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
-  if system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
+  existing = forwards_matching_ext_port(zone, ext_port, proto)
+  if existing.any? { |e| e[:ip] == internal_ip && e[:int_port] == internal_port.to_s }
     puts "Forward already configured."
     return
+  end
+  if (other = existing.first)
+    abort "Error: #{ext_port}/#{proto} is already forwarded to #{other[:ip]}:#{other[:int_port]}. " \
+          "Run: remove-forward #{ext_port} #{proto}"
   end
 
   rich_rule = port_forward_rich_rule(internal_ip, internal_port, proto)
@@ -534,13 +569,15 @@ def remove_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp
   abort "Error: Internal IP must be a VPN client address in #{VPN_SUBNET} (10.8.0.2–10.8.0.254)." unless validate_vpn_client_ip(internal_ip)
 
   zone, rule_target = port_forward_wan_zone_and_rule_target
-  forward_spec = "port=#{ext_port}:proto=#{proto}:toport=#{internal_port}:toaddr=#{internal_ip}"
-  unless system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-forward-port', forward_spec)
-    puts "No matching permanent forward (#{forward_spec})."
+  matches = forwards_matching_ext_port(zone, ext_port, proto).select do |e|
+    e[:ip] == internal_ip && e[:int_port] == internal_port.to_s
+  end
+  if matches.empty?
+    puts "No matching permanent forward (#{ext_port}/#{proto} -> #{internal_ip}:#{internal_port})."
     return
   end
 
-  run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', forward_spec)
+  matches.each { |e| remove_forward_entry(zone, e) }
 
   unless forward_still_targets_internal?(zone, internal_ip, internal_port, proto)
     rich_rule = port_forward_rich_rule(internal_ip, internal_port, proto)
@@ -637,18 +674,12 @@ end
 
 def remove_port_forwards_for(client_ip)
   zone, rule_target = port_forward_wan_zone_and_rule_target
-  to_remove = permanent_forward_port_lines(zone).select { |l| l.include?("toaddr=#{client_ip}") }
+  to_remove = forward_entries(zone).select { |e| e[:ip] == client_ip }
   return if to_remove.empty?
 
-  rich_pairs = []
-  to_remove.each do |line|
-    if line =~ /port=(\d+):proto=(\w+):toport=(\d+):toaddr=/
-      rich_pairs << [Regexp.last_match(3), Regexp.last_match(2).downcase]
-    end
-    run('firewall-cmd', '--permanent', "--zone=#{zone}", '--remove-forward-port', line)
-  end
+  to_remove.each { |e| remove_forward_entry(zone, e) }
 
-  rich_pairs.uniq.each do |internal_port, proto|
+  to_remove.map { |e| [e[:int_port], e[:proto]] }.uniq.each do |internal_port, proto|
     rich_rule = port_forward_rich_rule(client_ip, internal_port, proto)
     existing = permanent_rich_rules(rule_target)
     run('firewall-cmd', '--permanent', *rule_target, '--remove-rich-rule', rich_rule) if existing.include?(rich_rule)
@@ -729,15 +760,18 @@ def export_backup
 
   ts = Time.now.strftime('%Y%m%d%H%M%S')
   archive = File.expand_path("wg-vpn-export-#{ts}.tar.gz")
+  File.open(archive, 'w', 0o600) {}
   run('tar', 'czf', archive, '-C', '/etc', 'wireguard')
+  File.chmod(0o600, archive)
 
   wg_zone = effective_wg_zone('wg0')
   wan_zone = get_fw_zone
   forwards = begin
-    permanent_forward_port_lines(wan_zone)
+    forward_entries(wan_zone)
   rescue RuntimeError
     []
   end
+  direct = direct_dnat_rules
 
   manifest = File.expand_path("wg-vpn-export-#{ts}.txt")
   File.open(manifest, 'w') do |f|
@@ -750,14 +784,18 @@ def export_backup
     if forwards.empty?
       f.puts "  (none)"
     else
-      forwards.each { |line| f.puts "  #{line}" }
+      forwards.each { |e| f.puts "  [#{e[:kind]}] #{e[:line]}" }
+    end
+    unless direct.empty?
+      f.puts
+      f.puts "Legacy direct DNAT rules (copied only with /etc/firewalld):"
+      direct.each { |l| f.puts "  #{l}" }
     end
     f.puts
     f.puts "Re-add forwards after restore (if not restoring full firewalld):"
-    forwards.each do |line|
-      spec = parse_forward_spec(line)
-      next unless spec
-      f.puts "  ./wg-vpn.rb forward #{spec[:ext]} #{spec[:ip]} #{spec[:int_port]} #{spec[:proto]}"
+    f.puts "  (rich-rule forwards are re-added as plain forward-ports, without the destination-address limit)"
+    forwards.each do |e|
+      f.puts "  ./wg-vpn.rb forward #{e[:ext]} #{e[:ip]} #{e[:int_port]} #{e[:proto]}"
     end
     f.puts
     f.puts "Restore: tar xzf #{File.basename(archive)} -C /etc"
