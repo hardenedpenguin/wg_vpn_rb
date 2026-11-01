@@ -152,6 +152,33 @@ def installed?
   command_executable?('wg')
 end
 
+def package_installed?(pkg)
+  out, status = Open3.capture2('dpkg-query', '-W', '-f=${Status}', pkg, err: File::NULL)
+  status.success? && out.include?('install ok installed')
+end
+
+# Userspace only (wg, wg-quick). Do not install the wireguard metapackage or
+# recommends: those can pull wireguard-dkms and linux-headers, which fail or
+# bloat Chromebook / non-Debian-kernel environments where the module is in-tree.
+def ensure_packages
+  needed = []
+  needed << 'wireguard-tools' unless installed?
+
+  # openresolv conflicts with systemd-resolved; apt would remove it and break host DNS.
+  if package_installed?('systemd-resolved')
+    info 'systemd-resolved is installed and provides resolvconf; not installing openresolv.'
+  elsif !package_installed?('openresolv')
+    info 'Replacing resolvconf with openresolv.' if package_installed?('resolvconf')
+    needed << 'openresolv'
+  end
+
+  return if needed.empty?
+
+  info "Installing #{needed.join(', ')}..."
+  run('apt-get', 'update')
+  run('apt-get', 'install', '-y', '--no-install-recommends', *needed)
+end
+
 # Interface name from config filename. With multiple configs, prefers the active one.
 def default_interface
   confs = Dir[File.join(WG_DIR, '*.conf')].map { |p| File.basename(p, '.conf') }
@@ -168,15 +195,7 @@ def setup(config_path = nil)
   root_check
   debian_check
 
-  unless installed?
-    # Userspace only (wg, wg-quick). Do not install the wireguard metapackage or
-    # recommends: those can pull wireguard-dkms and linux-headers, which fail or
-    # bloat Chromebook / non-Debian-kernel environments where the module is in-tree.
-    info 'Installing WireGuard tools and dependencies...'
-    run('apt-get', 'update')
-    # openresolv provides the resolvconf command wg-quick uses for DNS= lines (lighter than resolvconf).
-    run('apt-get', 'install', '-y', '--no-install-recommends', 'wireguard-tools', 'openresolv')
-  end
+  ensure_packages
 
   config_path ||= (print 'Path to client config file: '; $stdin.gets&.strip)
   error 'Config path required' if config_path.nil? || config_path.empty?

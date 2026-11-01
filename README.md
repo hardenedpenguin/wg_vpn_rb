@@ -205,6 +205,8 @@ sudo ./wg-vpn.rb status
 
 **Requirements:** root, Debian.
 
+**Packages:** `setup` installs `wireguard-tools` and `openresolv` only if missing, and checks each one separately (so openresolv is installed even if `wg` already exists). If the Debian `resolvconf` package is present, apt replaces it with openresolv. If `systemd-resolved` is installed, openresolv is skipped because installing it would remove systemd-resolved.
+
 **Connection check:** After `wg-quick up`, configs with a `DNS =` line use **openresolv** (provides the `resolvconf` command) to point the system resolver at VPN DNS. That breaks hostname-based checks (`curl`, `ping google.com`) right after bring-up. The client script therefore verifies the tunnel using a **WireGuard handshake** and an optional **ping to the VPN gateway** (`10.8.0.1` on the tunnel, via the WireGuard interface)—no DNS. Set `WG_SKIP_VERIFY=1` to skip verification on `up`.
 
 **Commands:**
