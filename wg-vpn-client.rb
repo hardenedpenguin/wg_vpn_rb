@@ -47,11 +47,11 @@ end
 
 def validate_interface_name(name)
   return false if name.nil? || name.empty? || name.length > 15
-  name.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/)
+  name.match?(/\A[a-zA-Z0-9_][a-zA-Z0-9_.-]*\z/)
 end
 
 def require_valid_interface!(iface)
-  error "Invalid interface name '#{iface}' (must start with a letter or digit, max 15 chars, only letters/digits/._-)." unless validate_interface_name(iface)
+  error "Invalid interface name '#{iface}' (must start with a letter, digit, or underscore, max 15 chars, only letters/digits/._-)." unless validate_interface_name(iface)
   iface
 end
 
@@ -226,8 +226,8 @@ def setup(config_path = nil)
   FileUtils.mkdir_p(WG_DIR)
   FileUtils.chmod(0o700, WG_DIR)
 
-  # Keep dots and hyphens (e.g. my.node -> my.node); strip path sep, unsafe chars, and leading non-alnum.
-  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_.-]/, '').sub(/\A[^a-zA-Z0-9]+/, '')
+  # Keep dots, underscores, and hyphens (e.g. my.node, _node); strip path sep, unsafe chars, and leading punctuation.
+  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_.-]/, '').sub(/\A[^a-zA-Z0-9_]+/, '')
   base_name = 'wg0' if base_name.empty?
   if base_name.length > 15
     error "Interface name '#{base_name}' exceeds Linux's 15-character limit. Rename the .conf file to 15 chars or fewer."
@@ -238,6 +238,9 @@ def setup(config_path = nil)
   already_in_place = File.expand_path(config_path) == File.expand_path(dest)
 
   unless already_in_place
+    if File.file?(dest) && File.read(dest) != File.read(config_path)
+      error "Destination #{dest} already exists with different contents; refusing to overwrite."
+    end
     run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)
     info "Config secured at #{dest}"
   else

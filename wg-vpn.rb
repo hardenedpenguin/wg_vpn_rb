@@ -413,12 +413,14 @@ def setup_server
   FileUtils.chmod(0o700, WG_DIR)
   FileUtils.chmod(0o700, WG_CLIENTS)
 
+  key_generated = false
   unless File.file?(SERVER_KEY)
     priv = capture('wg', 'genkey')
     File.open(SERVER_KEY, 'w', 0o600) { |f| f.write(priv) }
     File.chmod(0o600, SERVER_KEY)
+    key_generated = true
   end
-  unless File.file?(SERVER_PUB)
+  if key_generated || !File.file?(SERVER_PUB)
     priv = File.read(SERVER_KEY).strip
     File.open(SERVER_PUB, 'w', 0o600) { |f| f.write(capture('wg', 'pubkey', stdin_data: priv)) }
     File.chmod(0o600, SERVER_PUB)
@@ -453,6 +455,12 @@ def setup_server
   run('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--add-port', "#{WG_PORT}/udp") unless permanent_port_open?(wan_zone, "#{WG_PORT}/udp")
 
   if wg_zone == wan_zone
+    unless system('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--query-forward',
+                  out: File::NULL, err: File::NULL)
+      abort "Error: Shared zone '#{wan_zone}' has intra-zone forwarding disabled. " \
+            "Enable it (firewall-cmd --permanent --zone=#{wan_zone} --add-forward) if safe for all zone members, " \
+            "or move wg0 to a dedicated zone."
+    end
     masq_rule = "rule family=\"ipv4\" source address=\"#{VPN_SUBNET}\" destination not address=\"#{VPN_SUBNET}\" masquerade"
     add_permanent_rich_rule_if_missing(["--zone=#{wan_zone}"], masq_rule)
   else
@@ -778,6 +786,7 @@ end
 
 def remove_peer_block_from_conf(client_ip)
   lines = File.readlines(WG_CONF)
+  ip_pattern = /\A\s*AllowedIPs\s*=\s*#{Regexp.escape(client_ip)}\//
   out = []
   i = 0
   while i < lines.size
@@ -788,7 +797,7 @@ def remove_peer_block_from_conf(client_ip)
         block << lines[i]
         i += 1
       end
-      out.concat(block) unless block.any? { |l| l.include?("AllowedIPs = #{client_ip}/") }
+      out.concat(block) unless block.any? { |l| l.match?(ip_pattern) }
     else
       out << lines[i]
       i += 1
