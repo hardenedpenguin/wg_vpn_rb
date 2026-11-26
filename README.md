@@ -27,7 +27,7 @@ A single-file **WireGuard VPN manager** in Ruby. Use it to set up a WireGuard se
 
 Requires **Debian** (or derivative) and a **default route**. Exits with an error if not.
 
-1. Installs **wireguard-tools**, **firewalld**, **openresolv**, **qrencode**, **curl** via `apt` (userspace only; does not install `wireguard-dkms` or kernel headers). **openresolv** provides the `resolvconf` command `wg-quick` uses if a config has `DNS =`.
+1. Installs **wireguard-tools**, **firewalld**, **qrencode**, **curl** (plus **openresolv** unless `systemd-resolved` is installed) via `apt` (userspace only; does not install `wireguard-dkms` or kernel headers). **openresolv** provides the `resolvconf` command `wg-quick` uses if a config has `DNS =`.
 2. Enables IPv4 forwarding (`net.ipv4.ip_forward=1`) in `/etc/sysctl.d/99-wireguard.conf`.
 3. Creates `/etc/wireguard` and `/etc/wireguard/clients`, generates server key pair if missing.
 4. Writes initial `wg0.conf` with `MTU = 1420` if it does not exist.
@@ -85,7 +85,7 @@ Run with no arguments for a menu:
 sudo ./wg-vpn.rb
 ```
 
-The menu prompts for each action. For **forward port**, it lists existing clients and asks for external port, internal port (defaults to external), internal IP, and protocol. **Remove port forward** uses the same fields so you remove the exact forward you added. Exit is option **9**.
+The menu prompts for each action. For **forward port**, it lists existing clients and asks for external port, internal port (defaults to external), internal IP, and protocol. **Remove port forward** uses the same fields so you remove the exact forward you added. **Export backup** is option **9** and Exit is option **10**.
 
 ### Commands (non-interactive)
 
@@ -234,7 +234,7 @@ sudo ./wg-vpn.rb status
    Or run `sudo ./wg-vpn-client.rb setup` and enter the path when prompted. The source file is removed after copying; only the copy in `/etc/wireguard` is kept.
 3. Say **y** when asked to enable on boot if you want the tunnel to start automatically.
 
-The interface name is derived from the config filename: only the `.conf` extension is stripped, and letters, digits, underscores, dots, and hyphens are kept (e.g. `node1.conf` → `node1`, `my.node.conf` → `my.node`). With one config in `/etc/wireguard`, `up`, `down`, `status`, `check`, `enable-boot`, and `disable-boot` auto-detect the interface.
+The interface name is derived from the config filename: only the `.conf` extension is stripped, and letters, digits, underscores, dots, and hyphens are kept (e.g. `node1.conf` → `node1`, `my.node.conf` → `my.node`), up to Linux's 15-character interface name limit. With one config in `/etc/wireguard`, `up`, `down`, `status`, `check`, `enable-boot`, and `disable-boot` auto-detect the interface.
 
 ---
 
