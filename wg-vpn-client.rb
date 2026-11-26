@@ -45,7 +45,26 @@ def command_executable?(name)
   false
 end
 
+def validate_interface_name(name)
+  return false if name.nil? || name.empty? || name.length > 15
+  name.match?(/\A[a-zA-Z0-9_][a-zA-Z0-9_.-]*\z/)
+end
+
+def require_valid_interface!(iface)
+  error "Invalid interface name '#{iface}' (must start with a letter, digit, or underscore, max 15 chars, only letters/digits/._-)." unless validate_interface_name(iface)
+  iface
+end
+
+def active_interfaces
+  return [] unless installed?
+  out, status = Open3.capture2('wg', 'show', 'interfaces')
+  status.success? ? out.to_s.split : []
+rescue SystemCallError
+  []
+end
+
 def conf_path_for(interface)
+  return nil unless validate_interface_name(interface)
   path = File.join(WG_DIR, "#{interface}.conf")
   File.file?(path) ? path : nil
 end
@@ -74,7 +93,7 @@ def latest_handshake_age_from_latest_handshakes(iface)
     _key, ts = line.split("\t", 2)
     hs = ts.to_s.strip.to_i
     next if hs <= 0
-    age = now - hs
+    age = [now - hs, 0].max
     best = age if best.nil? || age < best
   end
   best
@@ -86,6 +105,7 @@ def latest_handshake_age_from_show(iface)
   return nil unless status.success?
   out.each_line do |line|
     next unless line.include?('latest handshake:')
+    return 0 if line =~ /latest handshake:\s*Now\b/i
     if line =~ /latest handshake:\s*(\d+)\s+minute(?:s)?(?:,\s*(\d+)\s+second(?:s)?)?\s+ago/
       return ($1.to_i * 60) + ($2 || 0).to_i
     end
@@ -106,13 +126,14 @@ def latest_handshake_age_from_dump(iface)
   best = nil
   out.each_line do |line|
     fields = line.split("\t")
-    next if fields.size < 6
-    hs = fields[5].to_s.strip
+    # Peer lines: public-key, preshared-key, endpoint, allowed-ips, latest-handshake, transfer-rx, ...
+    next if fields.size < 5
+    hs = fields[4].to_s.strip
     next unless hs.match?(/\A\d+\z/)
     hs = hs.to_i
     next if hs <= 0
     next if hs < 1_000_000_000
-    age = now - hs
+    age = [now - hs, 0].max
     best = age if best.nil? || age < best
   end
   best
@@ -185,8 +206,7 @@ def default_interface
   return 'wg0' if confs.empty?
   return confs.first if confs.size == 1
 
-  out, = Open3.capture2('wg', 'show', 'interfaces')
-  active = (out || '').split
+  active = active_interfaces
   (confs & active).first || confs.first
 end
 
@@ -206,21 +226,31 @@ def setup(config_path = nil)
   FileUtils.mkdir_p(WG_DIR)
   FileUtils.chmod(0o700, WG_DIR)
 
-  # Keep dots and hyphens (e.g. my.node -> my.node); strip path sep and other unsafe chars
-  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_.-]/, '')
+  # Keep dots, underscores, and hyphens (e.g. my.node, _node); strip path sep, unsafe chars, and leading punctuation.
+  base_name = File.basename(config_path, '.conf').gsub(/[^a-zA-Z0-9_.-]/, '').sub(/\A[^a-zA-Z0-9_]+/, '')
   base_name = 'wg0' if base_name.empty?
+  if base_name.length > 15
+    error "Interface name '#{base_name}' exceeds Linux's 15-character limit. Rename the .conf file to 15 chars or fewer."
+  end
+  require_valid_interface!(base_name)
+
   dest = File.join(WG_DIR, "#{base_name}.conf")
   already_in_place = File.expand_path(config_path) == File.expand_path(dest)
 
   unless already_in_place
+    if File.file?(dest) && File.read(dest) != File.read(config_path)
+      error "Destination #{dest} already exists with different contents; refusing to overwrite."
+    end
     run('install', '-m', '600', '-o', 'root', '-g', 'root', config_path, dest)
-    File.delete(config_path) if File.exist?(config_path)
     info "Config secured at #{dest}"
   else
+    File.chown(0, 0, dest)
+    FileUtils.chmod(0o600, dest)
     info "Config already at #{dest}, bringing up tunnel."
   end
 
   run('wg-quick', 'up', base_name)
+  File.delete(config_path) if !already_in_place && File.exist?(config_path)
   verify_tunnel!(base_name, conf_path: dest)
 
   print 'Enable WireGuard on boot? [y/N]: '
@@ -235,31 +265,32 @@ end
 
 def up(interface = nil)
   root_check
-  iface = interface || default_interface
+  iface = require_valid_interface!(interface || default_interface)
   run('wg-quick', 'up', iface)
-  verify_tunnel!(iface, conf_path: conf_path_for(iface)) unless ENV['WG_SKIP_VERIFY']
+  verify_tunnel!(iface, conf_path: conf_path_for(iface)) unless ENV['WG_SKIP_VERIFY'] == '1'
 end
 
 def down(interface = nil)
   root_check
-  run('wg-quick', 'down', interface || default_interface)
+  iface = require_valid_interface!(interface || default_interface)
+  run('wg-quick', 'down', iface)
 end
 
 def show_status(interface = nil)
   root_check
-  run('wg', 'show', interface || default_interface)
+  iface = require_valid_interface!(interface || default_interface)
+  run('wg', 'show', iface)
 end
 
 def check_tunnel(interface = nil)
   root_check
-  iface = interface || default_interface
-  up, = Open3.capture2('wg', 'show', 'interfaces')
-  unless (up || '').split.include?(iface)
+  iface = require_valid_interface!(interface || default_interface)
+  unless active_interfaces.include?(iface)
     error "Interface #{iface} is not up. Run: #{$PROGRAM_NAME} up #{iface}"
   end
-  if tunnel_handshake_ok?(iface)
+  age = latest_handshake_age(iface)
+  if !age.nil? && age <= HANDSHAKE_MAX_AGE_SEC
     gateway = vpn_gateway_ip(conf_path_for(iface))
-    age = latest_handshake_age(iface)
     info "Handshake #{age}s ago."
     info "Ping #{gateway}: #{ping_vpn_gateway?(iface, gateway) ? 'OK' : 'failed (handshake still OK)'}"
     run('wg', 'show', iface)
@@ -271,12 +302,14 @@ end
 
 def enable_boot(interface = nil)
   root_check
-  run('systemctl', 'enable', "wg-quick@#{interface || default_interface}")
+  iface = require_valid_interface!(interface || default_interface)
+  run('systemctl', 'enable', "wg-quick@#{iface}")
 end
 
 def disable_boot(interface = nil)
   root_check
-  run('systemctl', 'disable', "wg-quick@#{interface || default_interface}")
+  iface = require_valid_interface!(interface || default_interface)
+  run('systemctl', 'disable', "wg-quick@#{iface}")
 end
 
 def list_interfaces
@@ -286,8 +319,7 @@ def list_interfaces
     info "No configs in #{WG_DIR}."
     return
   end
-  out, = Open3.capture2('wg', 'show', 'interfaces')
-  active = (out || '').split
+  active = active_interfaces
   puts "  %-20s  %s" % ["Interface", "Status"]
   puts "  " + "-" * 30
   confs.each do |iface|

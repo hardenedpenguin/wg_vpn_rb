@@ -7,6 +7,7 @@
 #
 
 require 'fileutils'
+require 'ipaddr'
 require 'open3'
 require 'tempfile'
 require 'timeout'
@@ -57,10 +58,11 @@ def effective_wg_zone(interface = 'wg0')
 end
 
 def zone_from_firewalld_xml(interface)
+  pattern = /<interface\s+name=["']#{Regexp.escape(interface)}["']\s*\/>/
   Dir['/etc/firewalld/zones/*.xml'].each do |path|
     base = File.basename(path)
     next if base.include?('.old') || base.include?('.bak') || base.include?('.dpkg-dist')
-    next unless File.read(path).include?(%(<interface name="#{interface}"/>))
+    next unless File.read(path).match?(pattern)
     return File.basename(path, '.xml')
   end
   ''
@@ -99,12 +101,21 @@ def ensure_policy(name, ingress_zone:, egress_zone:)
 end
 
 def permanent_port_open?(zone, port_spec)
-  system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-port', port_spec)
+  system('firewall-cmd', '--permanent', "--zone=#{zone}", '--query-port', port_spec,
+         out: File::NULL, err: File::NULL)
+end
+
+def permanent_rich_rule_present?(rule_target, rich_rule)
+  system('firewall-cmd', '--permanent', *rule_target, '--query-rich-rule', rich_rule,
+         out: File::NULL, err: File::NULL)
 end
 
 def add_permanent_rich_rule_if_missing(rule_target, rich_rule)
-  existing = permanent_rich_rules(rule_target)
-  run('firewall-cmd', '--permanent', *rule_target, '--add-rich-rule', rich_rule) unless existing.include?(rich_rule)
+  run('firewall-cmd', '--permanent', *rule_target, '--add-rich-rule', rich_rule) unless permanent_rich_rule_present?(rule_target, rich_rule)
+end
+
+def remove_permanent_rich_rule_if_present(rule_target, rich_rule)
+  run('firewall-cmd', '--permanent', *rule_target, '--remove-rich-rule', rich_rule) if permanent_rich_rule_present?(rule_target, rich_rule)
 end
 
 def run(*cmd)
@@ -149,7 +160,7 @@ end
 
 def port_forward_rich_rule(internal_ip, internal_port, proto)
   p = proto.to_s.downcase
-  "rule family='ipv4' destination address='#{internal_ip}' port port='#{internal_port}' protocol='#{p}' accept"
+  "rule family=\"ipv4\" destination address=\"#{internal_ip}\" port port=\"#{internal_port}\" protocol=\"#{p}\" accept"
 end
 
 # WAN zone + where per-forward rich rules live (policy when wg0 is in a separate zone).
@@ -164,9 +175,12 @@ def port_forward_wan_zone_and_rule_target
 end
 
 def parse_forward_spec(line)
-  return nil unless line =~ /\Aport=(\d+):proto=(\w+):toport=(\d+):toaddr=(\S+)\z/
-  { kind: :port, ext: Regexp.last_match(1), proto: Regexp.last_match(2).downcase,
-    int_port: Regexp.last_match(3), ip: Regexp.last_match(4), dest: nil, line: line }
+  return nil unless line =~ /\Aport=(\d+):proto=(\w+):toport=(\d*):toaddr=(\S+)\z/
+  ext = Regexp.last_match(1)
+  int_port = Regexp.last_match(3)
+  int_port = ext if int_port.empty?
+  { kind: :port, ext: ext, proto: Regexp.last_match(2).downcase,
+    int_port: int_port, ip: Regexp.last_match(4), dest: nil, line: line }
 end
 
 # Rich-rule forward, e.g. rule family="ipv4" destination address="10.10.2.3"
@@ -230,9 +244,52 @@ rescue RuntimeError
   ''
 end
 
-def validate_client_name(name)
-  return false if name.nil? || name.empty? || name.length > 64
+def validate_client_name(name, max_len: 15)
+  return false if name.nil? || name.empty? || name.length > max_len
   name.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/)
+end
+
+def validate_dns(dns_str)
+  return false if dns_str.nil? || dns_str.strip.empty?
+  parts = dns_str.split(',', -1).map(&:strip)
+  return false if parts.empty? || parts.any?(&:empty?)
+  parts.all? do |addr|
+    IPAddr.new(addr)
+    true
+  rescue IPAddr::InvalidAddressError
+    false
+  end
+end
+
+def format_endpoint(input)
+  return nil if input.nil? || input.empty? || input.match?(/[\s\r\n]/)
+  begin
+    ip = IPAddr.new(input)
+    return ip.ipv6? ? "[#{input}]:#{WG_PORT}" : "#{input}:#{WG_PORT}"
+  rescue IPAddr::InvalidAddressError
+    # Hostname or host:port / [ipv6]:port
+  end
+  if input =~ /\A\[([^\]]+)\]:(\d+)\z/
+    host = Regexp.last_match(1)
+    port = Regexp.last_match(2)
+    return nil unless validate_port(port)
+    begin
+      return nil unless IPAddr.new(host).ipv6?
+    rescue IPAddr::InvalidAddressError
+      return nil
+    end
+    return input
+  end
+  if input =~ /\A([^:]+):(\d+)\z/
+    return validate_port(Regexp.last_match(2)) ? input : nil
+  end
+  return nil if input.include?(':')
+  "#{input}:#{WG_PORT}"
+end
+
+def package_installed?(pkg)
+  out, status = Open3.capture2('dpkg-query', '-W', '-f=${Status}', pkg, err: File::NULL)
+  status.success? && out.include?('install ok installed')
 end
 
 def command_executable?(name)
@@ -249,10 +306,16 @@ def fetch_public_ip(timeout_sec: 10)
   urls = ['https://ifconfig.me/ip', 'https://icanhazip.com']
   urls.each do |url|
     out, _err, status = Timeout.timeout(timeout_sec) do
-      Open3.capture3('curl', '-s', '-f', '--max-time', '8', '--proto', '=https', url)
+      Open3.capture3('curl', '-4', '-s', '-f', '--max-time', '8', '--proto', '=https', url)
     end
     ip = out.to_s.strip
-    return ip if status.success? && ip.match?(/\A[\d.]+\z/)
+    if status.success?
+      begin
+        return ip if IPAddr.new(ip).ipv4?
+      rescue IPAddr::InvalidAddressError
+        next
+      end
+    end
   rescue Timeout::Error, SystemCallError
     next
   end
@@ -261,7 +324,7 @@ end
 
 def list_client_ips
   return [] unless File.file?(WG_CONF)
-  File.read(WG_CONF).scan(/AllowedIPs = (10\.8\.0\.\d+)\/32/).flatten.uniq.sort
+  File.read(WG_CONF).scan(/AllowedIPs = (10\.8\.0\.\d+)\/32/).flatten.uniq.sort_by { |ip| ip.split('.').last.to_i }
 end
 
 def list_client_names
@@ -274,6 +337,22 @@ def peer_names_from_conf
   File.read(WG_CONF).scan(/# Name = ([^\n]+)\s*$/).flatten.map(&:strip).uniq.sort
 end
 
+def peer_ip_to_name_map
+  return {} unless File.file?(WG_CONF)
+  map = {}
+  current_name = nil
+  File.foreach(WG_CONF) do |line|
+    if line.strip == '[Peer]'
+      current_name = nil
+    elsif line =~ /\A\s*#\s*Name\s*=\s*([^\n]+?)\s*\z/
+      current_name = Regexp.last_match(1)
+    elsif current_name && line =~ /\A\s*AllowedIPs\s*=\s*(10\.8\.0\.\d+)/
+      map[Regexp.last_match(1)] = current_name
+    end
+  end
+  map
+end
+
 def client_ip_for_name(name)
   return nil unless File.file?(WG_CONF)
   content = File.read(WG_CONF)
@@ -281,10 +360,10 @@ def client_ip_for_name(name)
   content.each_line do |line|
     if line.strip == '[Peer]'
       in_matching_peer = false
-    elsif line =~ /# Name = #{Regexp.escape(name)}\s*$/
+    elsif line =~ /\A\s*#\s*Name\s*=\s*#{Regexp.escape(name)}\s*\z/
       in_matching_peer = true
-    elsif in_matching_peer && line =~ /AllowedIPs = (10\.8\.0\.\d+)/
-      return $1
+    elsif in_matching_peer && line =~ /\A\s*AllowedIPs\s*=\s*(10\.8\.0\.\d+)/
+      return Regexp.last_match(1)
     end
   end
   nil
@@ -296,7 +375,7 @@ def root_check
 end
 
 def apply_wg_config
-  if capture('wg', 'show', 'interfaces').include?('wg0')
+  if capture('wg', 'show', 'interfaces').split.include?('wg0')
     puts "Syncing WireGuard configuration..."
     Tempfile.create(['wg_sync', '']) do |f|
       f.write(capture('wg-quick', 'strip', WG_CONF))
@@ -313,26 +392,38 @@ def setup_server
   debian_check
   wan = get_wan_interface
   abort 'Error: No default route found. Configure networking first.' if wan.nil? || wan.empty?
-  wan_zone = get_fw_zone
-  puts "Detected WAN: #{wan} (zone: #{wan_zone})"
 
   puts 'Installing WireGuard tools and Firewalld...'
   run('apt-get', 'update')
   # Userspace only (wg, wg-quick). Do not install the wireguard metapackage: it can
   # pull wireguard-dkms and linux-headers when the running kernel already has WireGuard.
-  # openresolv provides the resolvconf command wg-quick uses for DNS= lines (same as client).
-  run('apt-get', 'install', '-y', '--no-install-recommends',
-      'wireguard-tools', 'firewalld', 'openresolv', 'qrencode', 'curl')
+  # openresolv conflicts with systemd-resolved; skip it when systemd-resolved is present.
+  packages = %w[wireguard-tools firewalld qrencode curl]
+  if package_installed?('systemd-resolved')
+    puts 'systemd-resolved is installed; skipping openresolv.'
+  else
+    packages << 'openresolv'
+  end
+  run('apt-get', 'install', '-y', '--no-install-recommends', *packages)
 
   File.open('/etc/sysctl.d/99-wireguard.conf', 'w') { |f| f.puts "net.ipv4.ip_forward=1" }
   run('sysctl', '-p', '/etc/sysctl.d/99-wireguard.conf')
 
   FileUtils.mkdir_p(WG_CLIENTS, mode: 0o700)
+  FileUtils.chmod(0o700, WG_DIR)
+  FileUtils.chmod(0o700, WG_CLIENTS)
 
+  key_generated = false
   unless File.file?(SERVER_KEY)
     priv = capture('wg', 'genkey')
     File.open(SERVER_KEY, 'w', 0o600) { |f| f.write(priv) }
+    File.chmod(0o600, SERVER_KEY)
+    key_generated = true
+  end
+  if key_generated || !File.file?(SERVER_PUB)
+    priv = File.read(SERVER_KEY).strip
     File.open(SERVER_PUB, 'w', 0o600) { |f| f.write(capture('wg', 'pubkey', stdin_data: priv)) }
+    File.chmod(0o600, SERVER_PUB)
   end
 
   unless File.file?(WG_CONF)
@@ -344,16 +435,17 @@ def setup_server
       MTU = #{DEFAULT_MTU}
     CONF
     File.open(WG_CONF, 'w', 0o600) { |f| f.write(conf) }
+    File.chmod(0o600, WG_CONF)
   end
 
   puts "Configuring Firewall (policy-based)..."
-  run('systemctl', 'enable', '--now', 'firewalld')
-
-  zones = capture('firewall-cmd', '--permanent', '--get-zones').split(/[\s]+/)
-  run('firewall-cmd', '--permanent', '--new-zone=wireguard') unless zones.include?('wireguard')
+  ensure_firewalld_running
+  wan_zone = get_fw_zone
+  puts "Detected WAN: #{wan} (zone: #{wan_zone})"
 
   wg_zone = effective_wg_zone('wg0')
   if wg_zone.empty?
+    ensure_zone('wireguard')
     run('firewall-cmd', '--permanent', '--zone=wireguard', '--add-interface=wg0')
     wg_zone = 'wireguard'
   else
@@ -362,14 +454,21 @@ def setup_server
 
   run('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--add-port', "#{WG_PORT}/udp") unless permanent_port_open?(wan_zone, "#{WG_PORT}/udp")
 
-  policies = capture('firewall-cmd', '--permanent', '--get-policies').split(/[\s]+/)
-  run('firewall-cmd', '--permanent', '--new-policy=wg-to-wan') unless policies.include?('wg-to-wan')
-  ensure_policy('wg-to-wan', ingress_zone: wg_zone, egress_zone: wan_zone)
-  masq_rule = "rule family='ipv4' source address='#{VPN_SUBNET}' masquerade"
-  add_permanent_rich_rule_if_missing(['--policy=wg-to-wan'], masq_rule)
-
-  run('firewall-cmd', '--permanent', '--new-policy=wan-to-wg') unless policies.include?('wan-to-wg')
-  ensure_policy('wan-to-wg', ingress_zone: wan_zone, egress_zone: wg_zone)
+  if wg_zone == wan_zone
+    unless system('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--query-forward',
+                  out: File::NULL, err: File::NULL)
+      abort "Error: Shared zone '#{wan_zone}' has intra-zone forwarding disabled. " \
+            "Enable it (firewall-cmd --permanent --zone=#{wan_zone} --add-forward) if safe for all zone members, " \
+            "or move wg0 to a dedicated zone."
+    end
+    masq_rule = "rule family=\"ipv4\" source address=\"#{VPN_SUBNET}\" destination not address=\"#{VPN_SUBNET}\" masquerade"
+    add_permanent_rich_rule_if_missing(["--zone=#{wan_zone}"], masq_rule)
+  else
+    masq_rule = "rule family=\"ipv4\" source address=\"#{VPN_SUBNET}\" masquerade"
+    ensure_policy('wg-to-wan', ingress_zone: wg_zone, egress_zone: wan_zone)
+    add_permanent_rich_rule_if_missing(['--policy=wg-to-wan'], masq_rule)
+    ensure_policy('wan-to-wg', ingress_zone: wan_zone, egress_zone: wg_zone)
+  end
 
   run('firewall-cmd', '--reload')
   run('systemctl', 'enable', '--now', 'wg-quick@wg0')
@@ -472,7 +571,7 @@ def list_forwards
   entries = forward_entries(zone).sort_by { |e| [e[:ext].to_i, e[:proto]] }
   direct = direct_dnat_rules
 
-  ip_to_name = File.file?(WG_CONF) ? File.read(WG_CONF).scan(/# Name = ([^\n]+)\s*\n.*?AllowedIPs = (10\.8\.0\.\d+)/m).to_h { |name, ip| [ip, name.strip] } : {}
+  ip_to_name = peer_ip_to_name_map
 
   if entries.empty?
     puts "No port forwards configured."
@@ -547,13 +646,11 @@ def add_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp')
   end
 
   rich_rule = port_forward_rich_rule(internal_ip, internal_port, proto)
-  existing_rules = permanent_rich_rules(rule_target)
-  add_rich_rule = existing_rules.empty? || !existing_rules.include?(rich_rule)
 
   puts "Forwarding #{wan}:#{ext_port} -> #{internal_ip}:#{internal_port} (#{proto})"
 
   run('firewall-cmd', '--permanent', "--zone=#{zone}", '--add-forward-port', forward_spec)
-  add_permanent_rich_rule_if_missing(rule_target, rich_rule) if add_rich_rule
+  add_permanent_rich_rule_if_missing(rule_target, rich_rule)
 
   run('firewall-cmd', '--reload')
   puts "Done."
@@ -581,8 +678,7 @@ def remove_port_forward(ext_port, internal_ip, internal_port = nil, proto = 'udp
 
   unless forward_still_targets_internal?(zone, internal_ip, internal_port, proto)
     rich_rule = port_forward_rich_rule(internal_ip, internal_port, proto)
-    existing = permanent_rich_rules(rule_target)
-    run('firewall-cmd', '--permanent', *rule_target, '--remove-rich-rule', rich_rule) if existing.include?(rich_rule)
+    remove_permanent_rich_rule_if_present(rule_target, rich_rule)
   end
 
   run('firewall-cmd', '--reload')
@@ -619,7 +715,7 @@ def add_client
   print "Client Name (e.g., node1): "
   name = ($stdin.gets || '').strip.gsub(/\s+/, '-')
   abort "Error: Client name cannot be empty." if name.empty?
-  abort "Error: Client name must start with a letter or digit and contain only letters, digits, underscores, dots, and hyphens (max 64 chars)." unless validate_client_name(name)
+  abort "Error: Client name must start with a letter or digit and contain only letters, digits, underscores, dots, and hyphens (max 15 chars for Linux interface names)." unless validate_client_name(name)
   conf_path = File.join(WG_CLIENTS, "#{name}.conf")
   abort "Error: Client '#{name}' already exists. Choose another name or remove-client first." if File.file?(conf_path) || client_ip_for_name(name)
 
@@ -636,15 +732,16 @@ def add_client
   endpoint_input = ($stdin.gets || '').strip
   endpoint = if endpoint_input.empty?
     "#{fetch_public_ip}:#{WG_PORT}"
-  elsif endpoint_input.include?(':')
-    endpoint_input
   else
-    "#{endpoint_input}:#{WG_PORT}"
+    formatted = format_endpoint(endpoint_input)
+    abort "Error: Invalid endpoint '#{endpoint_input}'." unless formatted
+    formatted
   end
 
   print "Client DNS [#{CLIENT_DNS}]: "
   dns_input = ($stdin.gets || '').strip
   client_dns = dns_input.empty? ? CLIENT_DNS : dns_input
+  abort "Error: Invalid DNS '#{client_dns}' (must be comma-separated IP addresses)." unless validate_dns(client_dns)
 
   client_conf = <<~CONF
     [Interface]
@@ -681,8 +778,7 @@ def remove_port_forwards_for(client_ip)
 
   to_remove.map { |e| [e[:int_port], e[:proto]] }.uniq.each do |internal_port, proto|
     rich_rule = port_forward_rich_rule(client_ip, internal_port, proto)
-    existing = permanent_rich_rules(rule_target)
-    run('firewall-cmd', '--permanent', *rule_target, '--remove-rich-rule', rich_rule) if existing.include?(rich_rule)
+    remove_permanent_rich_rule_if_present(rule_target, rich_rule)
   end
 
   run('firewall-cmd', '--reload')
@@ -690,6 +786,7 @@ end
 
 def remove_peer_block_from_conf(client_ip)
   lines = File.readlines(WG_CONF)
+  ip_pattern = /\A\s*AllowedIPs\s*=\s*#{Regexp.escape(client_ip)}\//
   out = []
   i = 0
   while i < lines.size
@@ -700,7 +797,7 @@ def remove_peer_block_from_conf(client_ip)
         block << lines[i]
         i += 1
       end
-      out.concat(block) unless block.any? { |l| l.include?("AllowedIPs = #{client_ip}/") }
+      out.concat(block) unless block.any? { |l| l.match?(ip_pattern) }
     else
       out << lines[i]
       i += 1
@@ -726,6 +823,7 @@ end
 def remove_client(name, yes: false)
   root_check
   abort "Error: #{WG_CONF} not found. Run setup first." unless File.file?(WG_CONF)
+  abort "Error: Invalid client name '#{name}'." unless validate_client_name(name, max_len: 64)
 
   client_ip = client_ip_for_name(name)
   abort "Error: Client '#{name}' not found." unless client_ip
@@ -761,6 +859,7 @@ def export_backup
   ts = Time.now.strftime('%Y%m%d%H%M%S')
   archive = File.expand_path("wg-vpn-export-#{ts}.tar.gz")
   File.open(archive, 'w', 0o600) {}
+  File.chmod(0o600, archive)
   run('tar', 'czf', archive, '-C', '/etc', 'wireguard')
   File.chmod(0o600, archive)
 
@@ -774,7 +873,7 @@ def export_backup
   direct = direct_dnat_rules
 
   manifest = File.expand_path("wg-vpn-export-#{ts}.txt")
-  File.open(manifest, 'w') do |f|
+  File.open(manifest, 'w', 0o600) do |f|
     f.puts "WireGuard export #{ts}"
     f.puts "wg0 zone: #{wg_zone.empty? ? '(unassigned)' : wg_zone}"
     f.puts "WAN/default zone: #{wan_zone}"
@@ -803,9 +902,16 @@ def export_backup
     f.puts "and ensure wg0 appears in only one zone XML before firewall-cmd --reload."
   end
 
+  File.chmod(0o600, manifest)
+
   puts "Exported #{archive}"
   puts "Manifest #{manifest}"
   puts "wg0 zone: #{wg_zone.empty? ? '(unassigned)' : wg_zone}  WAN zone: #{wan_zone}"
+end
+
+def show_status
+  root_check
+  run('wg', 'show')
 end
 
 def run_menu
@@ -820,24 +926,30 @@ def run_menu
     puts "  6) List clients"
     puts "  7) Status"
     puts "  8) Remove port forward"
-    puts "  9) Exit"
+    puts "  9) Export backup"
+    puts " 10) Exit"
     print "Choice: "
     choice = $stdin.gets
     unless choice
       puts "Bye."
       break
     end
-    case choice.strip
-    when '1' then setup_server
-    when '2' then add_client
-    when '3' then forward_interactive
-    when '4' then remove_client_interactive
-    when '5' then list_forwards
-    when '6' then list_clients
-    when '7' then run('wg', 'show')
-    when '8' then remove_forward_interactive
-    when '9' then puts "Bye."; break
-    else puts "Invalid choice."
+    begin
+      case choice.strip
+      when '1' then setup_server
+      when '2' then add_client
+      when '3' then forward_interactive
+      when '4' then remove_client_interactive
+      when '5' then list_forwards
+      when '6' then list_clients
+      when '7' then show_status
+      when '8' then remove_forward_interactive
+      when '9' then export_backup
+      when '10' then puts "Bye."; break
+      else puts "Invalid choice."
+      end
+    rescue RuntimeError => e
+      warn "Error: #{e.message}"
     end
   end
 end
@@ -847,7 +959,7 @@ when 'setup'       then setup_server
 when 'add-client'  then add_client
 when 'remove-client'
   args = ARGV[1..] || []
-  yes = args.delete('-y') || ENV['WG_YES'] == '1'
+  yes = !!(args.delete('-y') || args.delete('--yes') || ENV['WG_YES'] == '1')
   name = args[0]
   if name
     remove_client(name, yes: yes)
@@ -870,7 +982,9 @@ when 'forward'
 when 'remove-forward'
   if ARGV[1]
     ext_port = ARGV[1]
-    if ARGV[2] && validate_vpn_client_ip(ARGV[2])
+    if ARGV[2].nil?
+      remove_port_forward_by_ext(ext_port)
+    elsif validate_vpn_client_ip(ARGV[2])
       internal_ip = ARGV[2]
       if ARGV[4]
         remove_port_forward(ext_port, internal_ip, ARGV[3], ARGV[4])
@@ -879,10 +993,10 @@ when 'remove-forward'
       else
         remove_port_forward(ext_port, internal_ip)
       end
-    elsif ARGV[2] && validate_proto(ARGV[2])
+    elsif validate_proto(ARGV[2])
       remove_port_forward_by_ext(ext_port, ARGV[2])
     else
-      remove_port_forward_by_ext(ext_port)
+      abort "Error: Invalid argument '#{ARGV[2]}'. Expected a VPN client IP (10.8.0.2-10.8.0.254) or protocol (tcp/udp)."
     end
   else
     remove_forward_interactive
@@ -890,7 +1004,7 @@ when 'remove-forward'
 when 'export'        then export_backup
 when 'list-forwards' then list_forwards
 when 'list-clients'  then list_clients
-when 'status'        then run('wg', 'show')
+when 'status'        then show_status
 when nil, 'menu'     then run_menu
 else
   puts "Commands: setup | add-client | remove-client [-y] [name] | forward [...] | remove-forward [...] | list-forwards | list-clients | export | status"
