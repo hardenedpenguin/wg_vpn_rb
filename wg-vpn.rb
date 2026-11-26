@@ -452,10 +452,11 @@ def setup_server
 
   run('firewall-cmd', '--permanent', "--zone=#{wan_zone}", '--add-port', "#{WG_PORT}/udp") unless permanent_port_open?(wan_zone, "#{WG_PORT}/udp")
 
-  masq_rule = "rule family=\"ipv4\" source address=\"#{VPN_SUBNET}\" masquerade"
   if wg_zone == wan_zone
+    masq_rule = "rule family=\"ipv4\" source address=\"#{VPN_SUBNET}\" destination not address=\"#{VPN_SUBNET}\" masquerade"
     add_permanent_rich_rule_if_missing(["--zone=#{wan_zone}"], masq_rule)
   else
+    masq_rule = "rule family=\"ipv4\" source address=\"#{VPN_SUBNET}\" masquerade"
     ensure_policy('wg-to-wan', ingress_zone: wg_zone, egress_zone: wan_zone)
     add_permanent_rich_rule_if_missing(['--policy=wg-to-wan'], masq_rule)
     ensure_policy('wan-to-wg', ingress_zone: wan_zone, egress_zone: wg_zone)
